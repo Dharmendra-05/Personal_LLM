@@ -2,25 +2,16 @@
 """
 Central coordinator for the Personal LLM Orchestrator.
 
-The :class:`SystemOrchestrator` is the *brain* of the application.  It wires
-together every subsystem built in the previous steps and exposes a single,
-clean :meth:`~SystemOrchestrator.process_query` method that the CLI calls for
-every user turn.  All business logic lives here; the CLI handles only I/O.
-
-Responsibilities
-----------------
-1. Bootstrap — Load settings, model registry, vector store, document loader,
-   and query router in the correct order.
-2. Routing — Delegate classification to QueryRouter; accept pre-computed
-   decisions to avoid the double-route log entries seen in earlier sessions.
-3. Streaming — Fast path via stream_query() for GENERAL_CHAT and
-   ADVANCED_KNOWLEDGE; tokens arrive in ~1-2 s vs ~40 s blocking.
-4. Retrieval — For PERSONAL_MEMORY queries search the vector store, collect
-   top-k chunks, and inject them as context.
-5. Conversation memory — Rolling window of last memory_turns exchanges.
-6. Generation — Build GenerationRequest, dispatch to LLM, return
-   OrchestratorResponse.
-7. Lifecycle — reload_knowledge_base() for hot-reloading without restart.
+Key changes vs previous version
+---------------------------------
+* stream_query() accepts max_tokens to cap generation length — critical
+  on 8 GB RAM where each 512-token block costs ~20 s on CPU.
+* stream_query() auto-retries with the cloud model (auto-advanced) when
+  Ollama raises OllamaConnectionError, so the session continues even if
+  the local server is down.
+* process_query() accepts max_tokens for the same reason.
+* Auto-index is deferred to first PERSONAL_MEMORY query; GENERAL_CHAT
+  never loads ChromaDB or the embedding model.
 """
 
 from __future__ import annotations
@@ -92,7 +83,6 @@ CONTEXT:
 @dataclass(slots=True)
 class ConversationTurn:
     """A single user/assistant exchange stored in conversation memory."""
-
     role: str
     content: str
     route_mode: RouteMode
@@ -102,7 +92,6 @@ class ConversationTurn:
 @dataclass(frozen=True, slots=True)
 class OrchestratorResponse:
     """Immutable result of a single process_query() call."""
-
     text: str
     route_mode: RouteMode
     model_name: str
@@ -118,11 +107,9 @@ class OrchestratorResponse:
         status = "OK" if self.success else f"ERROR: {self.error}"
         return (
             f"OrchestratorResponse("
-            f"mode={self.route_mode.name}, "
-            f"model={self.model_name!r}, "
+            f"mode={self.route_mode.name}, model={self.model_name!r}, "
             f"rag_chunks={self.rag_context_used}, "
-            f"dur={self.duration_seconds:.2f}s, "
-            f"status={status})"
+            f"dur={self.duration_seconds:.2f}s, status={status})"
         )
 
 
@@ -186,9 +173,9 @@ class SystemOrchestrator:
     def route_query(self, query: str) -> RoutingDecision:
         """Classify *query* without executing any LLM call.
 
-        Exposed so the CLI can inspect the routing decision once and pass it
-        directly to stream_query() or process_query() — eliminating the
-        double-route log entries visible in earlier sessions.
+        Exposed so the CLI can inspect the routing decision once and pass
+        it directly into stream_query() or process_query(), avoiding the
+        double-route log entries seen in earlier sessions.
         """
         return self._router.route(query)
 
@@ -197,25 +184,32 @@ class SystemOrchestrator:
         query: str,
         model_name: str | None = None,
         decision: RoutingDecision | None = None,
+        max_tokens: int | None = None,
     ) -> Iterator[str]:
-        """Stream response tokens for GENERAL_CHAT and ADVANCED_KNOWLEDGE queries.
+        """Stream response tokens for GENERAL_CHAT and ADVANCED_KNOWLEDGE.
 
-        This is the **fast path**.  Tokens are yielded as they arrive from
-        Ollama so the first word appears in ~1–2 s instead of ~40 s.
+        This is the fast path — tokens arrive in ~1–2 s instead of waiting
+        for the full completion (~40 s with blocking generate()).
 
-        For PERSONAL_MEMORY queries — which need RAG retrieval and may trigger
-        tool-call loops — use process_query() instead.
+        Auto-fallback
+        -------------
+        If Ollama raises ``OllamaConnectionError`` (e.g. ``ollama serve`` is
+        not running), stream_query() automatically retries the request using
+        the cloud fallback model (``auto-advanced``).  A one-line warning is
+        printed to the terminal before the fallback response streams.
 
         Args:
             query: The user's input string.
             model_name: Optional model override.
             decision: Pre-computed RoutingDecision from route_query().
                 When provided the router is not called again.
+            max_tokens: Cap on the number of tokens to generate.  Pass a
+                low value (e.g. 512) on low-RAM machines to bound latency.
 
         Yields:
-            str: Text chunks as they arrive from the LLM.  On error an
+            str: Text chunks as they arrive.  On unrecoverable error an
                 ``[Error: ...]`` string is yielded so the terminal always
-                receives something to display.
+                shows something.
         """
         if not query or not query.strip():
             yield "[Error: query must not be empty]"
@@ -244,67 +238,110 @@ class SystemOrchestrator:
         )
         prompt: str = self._build_prompt(query)
 
-        target_model = (
+        primary_model = (
             "auto-advanced"
             if decision.mode == RouteMode.ADVANCED_KNOWLEDGE
             else (model_name or self._default_model_name or self._first_model())
         )
 
-        try:
-            client = self._registry.get_model(target_model)
-        except Exception as exc:
-            logger.error("stream_query(): failed to get model %r: %s", target_model, exc)
-            yield f"[Error: could not load model '{target_model}' — {exc}]"
-            return
+        # Try primary model; fall back to cloud on connection failure.
+        models_to_try: list[tuple[str, bool]] = [
+            (primary_model, False),
+            ("auto-advanced", True),   # fallback — only tried on OllamaConnectionError
+        ]
 
-        messages: list[dict[str, Any]] = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+        for target_model, is_fallback in models_to_try:
+            if is_fallback and target_model == primary_model:
+                # No point retrying the same model.
+                break
 
-        request = GenerationRequest(messages=messages)
-        accumulated: list[str] = []
-
-        try:
-            if hasattr(client, "stream_generate"):
-                for chunk in client.stream_generate(request):
-                    accumulated.append(chunk)
-                    yield chunk
-            else:
-                # Fallback for API clients without streaming support.
-                logger.debug(
-                    "stream_query(): %s has no stream_generate — "
-                    "falling back to blocking generate()",
-                    type(client).__name__,
+            try:
+                client = self._registry.get_model(target_model)
+            except Exception as exc:
+                logger.error(
+                    "stream_query(): failed to get model %r: %s", target_model, exc
                 )
-                resp: GenerationResponse = client.generate(request)
-                accumulated.append(resp.text)
-                yield resp.text
+                if not is_fallback:
+                    continue
+                yield f"[Error: could not load any model — {exc}]"
+                return
 
-        except OllamaConnectionError as exc:
-            logger.error("stream_query(): OllamaConnectionError: %s", exc)
-            yield (
-                f"\n[Error: Cannot reach Ollama. "
-                f"Is `ollama serve` running? ({exc.error_code})]"
-            )
-        except LLMInferenceError as exc:
-            logger.error("stream_query(): LLMInferenceError: %s", exc)
-            yield f"\n[Error: LLM inference failed — {exc.message}]"
-        except Exception as exc:
-            logger.exception("stream_query(): unexpected error")
-            yield f"\n[Error: Unexpected error — {exc}]"
+            messages: list[dict[str, Any]] = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
 
-        # Update conversation history with the full accumulated response.
-        full_text = "".join(accumulated)
-        self._history.append(
-            ConversationTurn(role="user", content=query, route_mode=decision.mode)
-        )
-        if full_text:
-            self._history.append(
-                ConversationTurn(
-                    role="assistant", content=full_text, route_mode=decision.mode
+            req_kwargs: dict[str, Any] = {"messages": messages}
+            if max_tokens is not None:
+                req_kwargs["max_tokens"] = max_tokens
+
+            request = GenerationRequest(**req_kwargs)
+            accumulated: list[str] = []
+            ollama_failed = False
+
+            try:
+                if hasattr(client, "stream_generate"):
+                    for chunk in client.stream_generate(request):
+                        accumulated.append(chunk)
+                        yield chunk
+                else:
+                    # Fallback for API clients without streaming support.
+                    logger.debug(
+                        "stream_query(): %s has no stream_generate — "
+                        "falling back to blocking generate()",
+                        type(client).__name__,
+                    )
+                    resp: GenerationResponse = client.generate(request)
+                    accumulated.append(resp.text)
+                    yield resp.text
+
+                # Success — update history and return.
+                full_text = "".join(accumulated)
+                self._history.append(
+                    ConversationTurn(
+                        role="user", content=query, route_mode=decision.mode
+                    )
                 )
-            )
+                if full_text:
+                    self._history.append(
+                        ConversationTurn(
+                            role="assistant",
+                            content=full_text,
+                            route_mode=decision.mode,
+                        )
+                    )
+                return
+
+            except OllamaConnectionError as exc:
+                logger.warning(
+                    "stream_query(): Ollama unreachable (%s) — will try cloud fallback.",
+                    exc.error_code,
+                )
+                ollama_failed = True
+                # Yield a visible hint before the fallback response starts.
+                if not is_fallback:
+                    yield (
+                        "\n[Ollama unreachable — switching to cloud model …]\n\n"
+                    )
+                    continue   # retry loop with auto-advanced
+
+            except LLMInferenceError as exc:
+                logger.error("stream_query(): LLMInferenceError: %s", exc)
+                yield f"\n[Error: LLM inference failed — {exc.message}]"
+                return
+
+            except Exception as exc:
+                logger.exception("stream_query(): unexpected error")
+                yield f"\n[Error: Unexpected error — {exc}]"
+                return
+
+            if ollama_failed and is_fallback:
+                # Both models failed.
+                yield (
+                    "\n[Error: Ollama is unreachable and no cloud fallback is "
+                    "configured. Run `ollama serve` and try again.]"
+                )
+                return
 
     def process_query(
         self,
@@ -316,16 +353,17 @@ class SystemOrchestrator:
     ) -> OrchestratorResponse:
         """Blocking pipeline for PERSONAL_MEMORY (RAG + tool-call loop).
 
-        For GENERAL_CHAT and ADVANCED_KNOWLEDGE use stream_query() — it
-        delivers the first token ~20-40× faster.
+        For GENERAL_CHAT and ADVANCED_KNOWLEDGE use stream_query() instead —
+        it delivers first tokens ~20–40× faster.
 
         Args:
             query: The user's input string.
-            model_name: Override the default model for this query.
+            model_name: Override the default model.
             temperature: Override the default temperature.
-            max_tokens: Override the default max tokens.
-            decision: Pre-computed RoutingDecision — skips the internal
-                router call when the CLI already called route_query().
+            max_tokens: Cap generation length.  Recommended: 2048 for RAG,
+                512 for chat on low-RAM machines.
+            decision: Pre-computed RoutingDecision — skips internal router
+                call when the CLI already called route_query().
 
         Returns:
             OrchestratorResponse — always returned, never raises.
@@ -364,8 +402,8 @@ class SystemOrchestrator:
             decision.mode.name, decision.confidence, query[:60],
         )
 
-        # Step 2: Deferred auto-index — only for PERSONAL_MEMORY queries.
-        # GENERAL_CHAT never needs the vector store; don't pay cold-start cost.
+        # Step 2: Deferred auto-index — PERSONAL_MEMORY only.
+        # GENERAL_CHAT never touches ChromaDB or the embedding model.
         if (
             self._auto_index
             and not self._auto_indexed
@@ -373,7 +411,7 @@ class SystemOrchestrator:
         ):
             self._auto_index_if_empty()
 
-        # Step 3: Retrieve context
+        # Step 3: RAG retrieval
         context_chunks: list[dict[str, Any]] = []
         if decision.mode == RouteMode.PERSONAL_MEMORY and self._vector_store is not None:
             context_chunks = self._retrieve_context(query)
@@ -469,7 +507,9 @@ class SystemOrchestrator:
         if gen_response is not None:
             self._history.append(
                 ConversationTurn(
-                    role="assistant", content=gen_response.text, route_mode=decision.mode
+                    role="assistant",
+                    content=gen_response.text,
+                    route_mode=decision.mode,
                 )
             )
 
@@ -495,13 +535,17 @@ class SystemOrchestrator:
             duration_seconds=wall_elapsed,
         )
 
+    # ------------------------------------------------------------------
+    # Knowledge base management
+    # ------------------------------------------------------------------
+
     def reload_knowledge_base(self, confirm_reindex: bool = True) -> dict[str, Any]:
         """Re-scan the document directory and re-index all chunks."""
         logger.info(
-            "SystemOrchestrator.reload_knowledge_base(): scanning %s (reindex=%s)",
+            "reload_knowledge_base(): scanning %s (reindex=%s)",
             self._data_dir, confirm_reindex,
         )
-        start: float = time.perf_counter()
+        start = time.perf_counter()
 
         from core.knowledge_base.document_loader import DocumentLoader  # noqa: PLC0415
 
@@ -591,9 +635,13 @@ class SystemOrchestrator:
     def _initialise_registry(self) -> None:
         from models.registry import ModelRegistry  # noqa: PLC0415
 
-        logger.debug("SystemOrchestrator: loading ModelRegistry from %s", self._model_configs_dir)
+        logger.debug(
+            "SystemOrchestrator: loading ModelRegistry from %s", self._model_configs_dir
+        )
         try:
-            self._registry = ModelRegistry(configs_dir=self._model_configs_dir, auto_load=True)
+            self._registry = ModelRegistry(
+                configs_dir=self._model_configs_dir, auto_load=True
+            )
         except PersonalLLMException:
             raise
         except Exception as exc:
@@ -608,7 +656,8 @@ class SystemOrchestrator:
             if models:
                 self._default_model_name = models[0]
                 logger.info(
-                    "SystemOrchestrator: default model set to '%s'", self._default_model_name
+                    "SystemOrchestrator: default model set to '%s'",
+                    self._default_model_name,
                 )
         logger.info(
             "SystemOrchestrator: ModelRegistry loaded — %d model(s): %s",
@@ -619,7 +668,8 @@ class SystemOrchestrator:
         from core.knowledge_base.vector_store import VectorStore  # noqa: PLC0415
 
         logger.debug(
-            "SystemOrchestrator: initialising VectorStore (model=%s, device=%s, persist=%s)",
+            "SystemOrchestrator: initialising VectorStore "
+            "(model=%s, device=%s, persist=%s)",
             self._embedding_model, self._embedding_device, self._chroma_persist_dir,
         )
         self._vector_store = VectorStore(
@@ -645,7 +695,9 @@ class SystemOrchestrator:
                     )
                     try:
                         result = self.reload_knowledge_base(confirm_reindex=True)
-                        logger.info("SystemOrchestrator: auto-index complete: %s", result)
+                        logger.info(
+                            "SystemOrchestrator: auto-index complete: %s", result
+                        )
                     except Exception as exc:
                         logger.error("SystemOrchestrator: auto-index failed: %s", exc)
                 else:
@@ -655,13 +707,13 @@ class SystemOrchestrator:
                     )
             else:
                 logger.info(
-                    "SystemOrchestrator: collection has %d docs — skipping auto-index.", count
+                    "SystemOrchestrator: collection has %d docs — skipping.", count
                 )
         except Exception as exc:
-            logger.error("Failed to check collection count for auto-index: %s", exc)
+            logger.error("Failed to check collection count: %s", exc)
             from core.exceptions import PipelineError
             raise PipelineError(
-                message=f"Auto-index failed on startup: {exc}", stage="bootstrap"
+                message=f"Auto-index failed: {exc}", stage="bootstrap"
             ) from exc
 
     # ------------------------------------------------------------------
@@ -674,12 +726,12 @@ class SystemOrchestrator:
                 query=query, k=self.rag_top_k, min_score=0.1
             )
             logger.debug(
-                "_retrieve_context(): %d chunks retrieved (top score=%.3f)",
+                "_retrieve_context(): %d chunks (top score=%.3f)",
                 len(results), results[0].score if results else 0.0,
             )
             return [r.to_dict() for r in results]
         except VectorStoreError as exc:
-            logger.error("_retrieve_context() vector store error: %s", exc)
+            logger.error("_retrieve_context() VectorStoreError: %s", exc)
             from core.exceptions import ContextRetrievalError
             raise ContextRetrievalError(
                 message=f"Retrieval failed: {exc}", query=query
@@ -698,9 +750,9 @@ class SystemOrchestrator:
     def _build_system_prompt(
         self, mode: RouteMode, context_chunks: list[dict[str, Any]]
     ) -> str:
-        history_block: str = self._format_history_block()
+        history_block = self._format_history_block()
         if mode == RouteMode.PERSONAL_MEMORY:
-            context_text: str = self._format_context_block(context_chunks)
+            context_text = self._format_context_block(context_chunks)
             return _SYSTEM_PROMPT_RAG.format(
                 context=context_text or "(no relevant context found)",
                 history=history_block,
@@ -755,7 +807,7 @@ class SystemOrchestrator:
         duration_seconds: float = 0.0,
     ) -> OrchestratorResponse:
         logger.warning(
-            "SystemOrchestrator: error response for query=%r error=%s", query[:60], error
+            "SystemOrchestrator: error for query=%r: %s", query[:60], error
         )
         return OrchestratorResponse(
             text="",
