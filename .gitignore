@@ -5,12 +5,12 @@
 .env
 
 # Assets and Media
-assets/
+
 
 # Application Logs and Data
 logs/
 data/
-models/
+
 .scan_cache.json
 
 # Testing

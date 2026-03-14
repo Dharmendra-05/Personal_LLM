@@ -1,0 +1,89 @@
+# ==== models/model_configs/local_llama3.yaml ====
+#
+# Model configuration: Meta LLaMA-3 8B via Ollama
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisites:
+#   1. Ollama must be running:  `ollama serve`
+#   2. Model must be pulled:    `ollama pull llama3`
+#
+# This config targets the default llama3 (8B) model.  For the 70B variant,
+# set model_tag: "llama3:70b" and increase timeout to 300+.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+
+# Unique registry key — used as the argument to ModelRegistry.get_model().
+name: local-llama3
+
+# Human-readable description shown in tooling / dashboards.
+description: "Meta LLaMA-3 8B Instruct — general-purpose chat and instruction following"
+
+# Arbitrary labels for filtering / grouping in the registry.
+tags:
+  - chat
+  - instruct
+  - general-purpose
+  - meta
+  - llama
+
+
+# ── Provider ──────────────────────────────────────────────────────────────────
+
+# Provider identifier — must match a key in models/registry._PROVIDER_REGISTRY.
+provider: ollama
+
+# The Ollama model tag as returned by `ollama list`.
+# Format: <family>[:<variant>]   e.g. llama3, llama3:70b, llama3:8b-instruct-q4_0
+model_tag: llama3:latest
+
+# Base URL of the Ollama HTTP server.
+base_url: http://127.0.0.1:11434
+
+
+# ── Network ───────────────────────────────────────────────────────────────────
+
+# Per-request HTTP timeout in seconds.
+# Llama3-8B typically generates the first token within 2–10s on modern
+# hardware; increase this value if you are running on CPU-only.
+timeout: 120
+
+# How long Ollama keeps the model loaded in VRAM after the last request.
+# Increase if you make frequent back-to-back calls (avoids reload latency).
+# Set to "0" to unload immediately after each request.
+keep_alive: "5m"
+
+
+# ── Inference defaults ────────────────────────────────────────────────────────
+# These values are used when GenerationRequest does not override them.
+
+# Sampling temperature: 0.0 = fully deterministic, 2.0 = very random.
+# 0.7 is a good balance for instruction-following tasks.
+temperature: 0.7
+
+# Maximum number of tokens to generate.
+# 0 = use Ollama's built-in default (usually ~2048 for llama3).
+# Set explicitly if you need reproducible context-window behaviour.
+max_tokens: 2048
+
+# Nucleus sampling: only consider tokens whose cumulative probability ≤ top_p.
+# 1.0 disables nucleus sampling (use all tokens).
+top_p: 0.9
+
+# Top-k sampling: consider only the top-k most probable tokens.
+# 0 disables top-k (use all tokens filtered by top_p).
+top_k: 40
+
+# Repetition penalty: values > 1.0 reduce repeated phrases.
+# 1.1 provides a mild nudge against repetition without distorting output.
+repeat_penalty: 1.1
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+# Default system prompt injected into every generation request for this model.
+# Individual requests can override this by setting GenerationRequest.system_prompt.
+# Leave as null / omit to use no system prompt by default.
+system_prompt: >
+  You are a knowledgeable and concise AI assistant. Answer questions accurately
+  and helpfully. If you are unsure, say so rather than guessing. Keep responses
+  focused and avoid unnecessary padding.

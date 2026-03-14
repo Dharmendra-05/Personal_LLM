@@ -1,0 +1,90 @@
+# ==== models/model_configs/local_gemma.yaml ====
+#
+# Model configuration: Google Gemma 7B Instruct via Ollama
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisites:
+#   1. Ollama must be running:  `ollama serve`
+#   2. Model must be pulled:    `ollama pull gemma:7b`
+#
+# Gemma 7B is Google's open-weight model, well-suited for instruction
+# following and code-related tasks.  For the smaller 2B variant, change
+# model_tag to "gemma:2b" (lower latency, lower quality).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+
+# Unique registry key — used as the argument to ModelRegistry.get_model().
+name: local-gemma
+
+# Human-readable description shown in tooling / dashboards.
+description: "Google Gemma 7B Instruct — compact, efficient, strong at reasoning and code"
+
+# Arbitrary labels for filtering / grouping in the registry.
+tags:
+  - chat
+  - instruct
+  - code
+  - reasoning
+  - google
+  - gemma
+
+
+# ── Provider ──────────────────────────────────────────────────────────────────
+
+# Provider identifier — must match a key in models/registry._PROVIDER_REGISTRY.
+provider: ollama
+
+# The Ollama model tag as returned by `ollama list`.
+# Options: gemma:2b, gemma:7b, gemma:7b-instruct, gemma:7b-instruct-q4_0, etc.
+model_tag: gemma:7b
+
+# Base URL of the Ollama HTTP server.
+# Base URL of the Ollama HTTP server.
+base_url: http://127.0.0.1:11434
+
+
+# ── Network ───────────────────────────────────────────────────────────────────
+
+# Per-request HTTP timeout in seconds.
+# Gemma 7B is faster than LLaMA-3 8B on comparable hardware.
+# Reduce to 90 on GPU; keep at 180 for CPU-only inference.
+timeout: 180
+
+# Ollama model keep-alive duration.
+# "10m" keeps Gemma hot in memory for longer, useful if switching between
+# models frequently in the same session.
+keep_alive: "10m"
+
+
+# ── Inference defaults ────────────────────────────────────────────────────────
+
+# Lower temperature than LLaMA-3: Gemma is well-calibrated and benefits
+# from slightly more deterministic sampling, especially for code tasks.
+temperature: 0.6
+
+# Max tokens: Gemma 7B has an 8K context window in most Ollama builds.
+# Setting 4096 leaves room for the prompt + system prompt.
+max_tokens: 4096
+
+# Nucleus sampling: 0.95 gives a slightly wider token distribution than
+# LLaMA-3's 0.9, helping Gemma's diversity on creative prompts.
+top_p: 0.95
+
+# Top-k: 50 is the standard Gemma recommendation from Google's model card.
+top_k: 50
+
+# Repeat penalty: Gemma 7B is less prone to repetition than earlier models;
+# 1.05 is a conservative setting.
+repeat_penalty: 1.05
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+# Gemma responds well to concise, directive system prompts.
+# Tailored here for code and technical reasoning tasks.
+# Set to null / omit to use no system prompt for this model.
+system_prompt: >
+  You are a precise and efficient AI assistant with expertise in software
+  engineering, mathematics, and logical reasoning. Provide clear, correct,
+  and well-structured answers. For code tasks, include brief comments
+  explaining key decisions. Prefer conciseness over verbosity.

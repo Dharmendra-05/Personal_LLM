@@ -1,0 +1,18 @@
+How_to_make_venv_in_wsl
+-------------------------
+
+
+1. Manually
+===========
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+*****************************************************************************************
+
+
+2. Alltogether including requirements.txt
+==========================================
+
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt

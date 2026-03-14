@@ -1,0 +1,8 @@
+name: local-vision
+provider: ollama
+model_tag: llava:latest
+base_url: http://localhost:11434
+temperature: 0.1
+max_tokens: 1024
+description: "LLaVA vision model via Ollama"
+tags: [vision, image]
