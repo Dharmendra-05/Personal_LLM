@@ -1,0 +1,41 @@
+# ==============================================================================
+# Personal LLM Orchestrator — Dependency Manifest
+# ==============================================================================
+# All versions are strictly pinned to guarantee reproducible builds.
+# To install: pip install -r requirements.txt
+# To upgrade a dependency, benchmark and test before changing the pin.
+# ==============================================================================
+
+# --- Core HTTP & Networking ---
+requests==2.32.3
+urllib3==2.2.3                  # Explicit pin; indirect dep of requests
+
+# --- Configuration & Environment ---
+pyyaml==6.0.2
+pydantic==2.7.4
+pydantic-settings==2.3.4
+python-dotenv==1.0.1            # .env file loading (used by pydantic-settings)
+
+# --- Vector Database ---
+chromadb==0.5.3
+
+# --- Embeddings & Sentence Transformers ---
+sentence-transformers==3.0.1
+torch==2.3.1                    # Backing runtime for sentence-transformers
+transformers==4.42.4            # HuggingFace model hub integration
+huggingface-hub==0.23.4         # Model/artifact downloading
+
+# --- Typing & Validation Utilities ---
+typing-extensions==4.12.2       # Backports for 3.10+ typing constructs
+annotated-types==0.7.0          # Required by pydantic v2
+
+# --- Async Support ---
+anyio==4.4.0
+httpx==0.27.0                   # Async-capable HTTP client (Ollama REST calls)
+
+# --- Observability / Logging (no external deps required; stdlib only) ---
+# RotatingFileHandler is part of Python's logging.handlers stdlib module.
+
+# --- Development & Static Analysis (not installed in production) ---
+# mypy==1.10.1
+# ruff==0.5.0

@@ -1,0 +1,22 @@
+# Virtual Environment
+.venv/
+
+# Secrets and API Keys (Crucial!)
+.env
+
+# Assets and Media
+assets/
+
+# Application Logs and Data
+logs/
+data/
+models/
+.scan_cache.json
+
+# Testing
+tests/
+
+# Python Cache Files
+__pycache__/
+*.py[cod]
+*$py.class
