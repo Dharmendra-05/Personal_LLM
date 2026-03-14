@@ -36,6 +36,7 @@ Usage
 """
 
 from __future__ import annotations
+
 import os
 import sys
 import warnings
@@ -53,27 +54,24 @@ try:
     import chromadb.telemetry.product
     import chromadb.telemetry.posthog
     import chromadb.telemetry.segment
-    
-    def _noop(*args, **kwargs): 
+
+    def _noop(*args, **kwargs):
         return None
-        
+
     for mod in [chromadb.telemetry.product, chromadb.telemetry.posthog, chromadb.telemetry.segment]:
         for cls_name in ["Posthog", "AnonymousTelemetry", "Sentry"]:
             if hasattr(mod, cls_name):
                 cls = getattr(mod, cls_name)
-                # Patch class methods
                 cls.capture = _noop
                 cls.send = _noop
-                # Patch __init__ to prevent background thread instantiation
                 cls.__init__ = _noop
 except Exception:
     pass
-# -----------------------------------------------------------
-# -------------------------------------
+
+# ---------------------------------------------------------------------------
 
 import argparse
 import shutil
-import sys
 import textwrap
 import time
 from pathlib import Path
@@ -159,16 +157,15 @@ def _purple_gradient(text: str) -> str:
     lines = text.strip("\n").split("\n")
     if not lines:
         return text
-        
+
     result = []
-    # Gradient from bright magenta (255, 0, 255) to deep indigo/purple (85, 0, 255)
     for i, line in enumerate(lines):
         ratio = i / max(1, len(lines) - 1)
         r = int(255 - (170 * ratio))
         g = 0
         b = 255
         result.append(f"\033[38;2;{r};{g};{b}m{line}\033[0m")
-    
+
     return "\n" + "\n".join(result) + "\n"
 
 # ---------------------------------------------------------------------------
@@ -193,7 +190,6 @@ _VERSION: Final[str] = "v1.1.0"
 # Slash command registry
 # ---------------------------------------------------------------------------
 
-# Displayed in /help output: (command, argument, description)
 _COMMANDS: Final[list[tuple[str, str, str]]] = [
     ("/help",    "",           "Show this help message"),
     ("/models",  "",           "List all registered LLM models"),
@@ -203,7 +199,7 @@ _COMMANDS: Final[list[tuple[str, str, str]]] = [
     ("/clear",   "",           "Clear conversation history"),
     ("/health",  "",           "Check subsystem connectivity"),
     ("/route",   "<query>",    "Show routing decision for a query (dry run)"),
-    ("/model",   "<name>",     "Switch default model for this session"),
+    ("/model",   "<n>",        "Switch default model for this session"),
     ("/debug",   "<query>",    "Process query and show full metadata"),
     ("/exit",    "",           "Exit the orchestrator"),
     ("/quit",    "",           "Exit the orchestrator"),
@@ -414,9 +410,8 @@ def _handle_route(orch: SystemOrchestrator, args_str: str) -> None:
         _print_error("Usage: /route <query>")
         return
     _print_section("Routing Decision (dry run)")
-    from core.router import QueryRouter  # noqa: PLC0415
-    router = QueryRouter()
-    explanation = router.explain(query)
+    # Re-use the orchestrator's own router so results are consistent
+    explanation = orch._router.explain(query)
     for line in explanation.split("\n"):
         print(f"    {line}")
     print()
@@ -432,7 +427,7 @@ def _handle_model_switch(
     if not name:
         current = session_model[0] or orch._default_model_name or "(auto)"
         _print_info(f"Current model: {_bold(current)}")
-        _print_info("Usage: /model <name>   (see /models for available names)")
+        _print_info("Usage: /model <n>   (see /models for available names)")
         return
     if not orch._registry.is_registered(name):
         _print_error(f"Model '{name}' not found. Use /models to list available models.")
@@ -448,11 +443,7 @@ def _handle_model_switch(
 
 
 def _build_arg_parser(settings: "AppSettings") -> argparse.ArgumentParser:
-    """Build and return the CLI argument parser.
-
-    Returns:
-        Configured :class:`argparse.ArgumentParser`.
-    """
+    """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="personal-llm-orchestrator",
         description="Personal LLM Orchestrator — local AI with RAG pipeline.",
@@ -555,7 +546,6 @@ def _run_repl(
         try:
             raw = input(_bold(_cyan("  You › "))).strip()
         except EOFError:
-            # stdin closed (e.g. pipe/redirect ended)
             print()
             _print_info("EOF detected — exiting.")
             break
@@ -595,7 +585,6 @@ def _run_repl(
             elif cmd == "/model":
                 _handle_model_switch(orch, args_str, session_model)
             elif cmd == "/debug":
-                # Process the rest as a query but always show metadata
                 query = args_str.strip()
                 if not query:
                     _print_error("Usage: /debug <query>")
@@ -610,16 +599,17 @@ def _run_repl(
             continue
 
         # ── Regular query → orchestrator ─────────────────────────────────
-        # Determine if we need to show "Thinking" indicator (skip for greetings)
-        from core.router import RouteMode
-        decision = orch._router.route(raw)
-        
+        # Route ONCE here — the decision is passed directly into process_query
+        # so the router is not called a second time inside the orchestrator.
+        decision = orch.route_query(raw)
+
         if decision.mode != RouteMode.GENERAL_CHAT:
             _print_info("Thinking …")
-            
+
         resp = orch.process_query(
             raw,
             model_name=session_model[0],
+            decision=decision,          # ← pre-computed, no double-route
         )
         _print_response(resp, show_metadata=show_metadata)
 
@@ -632,11 +622,8 @@ def _handle_exit() -> None:
     print(_magenta("  ║") + "   Goodbye!  🤖                         " + _magenta("║"))
     print(_magenta("  ╚══════════════════════════════════════╝"))
     print()
-    # Force exit to bypass lingering threads or slow cleanup
     sys.stdout.flush()
     os._exit(0)
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -645,11 +632,7 @@ def _handle_exit() -> None:
 
 
 def _print_startup_status(orch: SystemOrchestrator) -> None:
-    """Print a brief status block after the orchestrator initialises.
-
-    Args:
-        orch: Fully initialised orchestrator.
-    """
+    """Print a brief status block after the orchestrator initialises."""
     models = orch.list_models()
     stats = orch.get_collection_stats()
     health = orch.health_check()
@@ -659,8 +642,7 @@ def _print_startup_status(orch: SystemOrchestrator) -> None:
 
     print(_bold("  System Status"))
     print(_dim("  " + "─" * 46))
-    
-    # Default model info
+
     default_model_name = orch._default_model_name or "(none)"
     if default_model_name != "(none)":
         try:
@@ -671,18 +653,15 @@ def _print_startup_status(orch: SystemOrchestrator) -> None:
     else:
         url = "N/A"
 
-    # Registry
     print(f"  {_status_icon(health.get('registry', False))}  "
           f"Model Registry    {len(models)} model(s)")
-    
-    # Vector Store - Handle deferred/lazy state
+
     vs_health = health.get('vector_store', False)
     count = stats.get('document_count', -1)
     count_str = f"{count} chunks" if count >= 0 else _dim("Deferred")
     print(f"  {_status_icon(vs_health)}  "
           f"Vector Store      {count_str}")
-    
-    # Default Model
+
     dm_ok = health.get('default_model', False)
     print(f"  {_status_icon(dm_ok)}  "
           f"Default Model     {_bold(default_model_name)} @ {url}")
@@ -691,7 +670,7 @@ def _print_startup_status(orch: SystemOrchestrator) -> None:
         print()
         print(_yellow("  ⚠  Ollama is not reachable at ") + _bold(url))
         print(_dim("     Ensure `ollama serve` is running. Type /health to retry connection."))
-    
+
     print(_dim("  " + "─" * 46))
     print()
 
@@ -709,15 +688,13 @@ def main() -> int:
     """
     from core.config import get_settings
     from core.utils.logger import configure_from_settings
-    
-    # Configure initial logging from AppSettings (.env)
+
     configure_from_settings()
     settings = get_settings()
 
     parser = _build_arg_parser(settings)
     args = parser.parse_args()
 
-    # Re-configure logging with debug level if requested
     if args.debug:
         setup_logging(
             console_level="DEBUG",
@@ -725,10 +702,8 @@ def main() -> int:
         )
         logger.debug("Debug mode enabled via --debug flag.")
 
-    # ── Banner ──────────────────────────────────────────────────────────────
     _print_banner()
 
-    # ── Initialise orchestrator ──────────────────────────────────────────────
     print(_bold("  Initialising …"), end="", flush=True)
     try:
         orch = SystemOrchestrator(
@@ -756,14 +731,11 @@ def main() -> int:
         logger.critical("Unexpected startup error", exc_info=True)
         return 1
 
-    # ── Status block ────────────────────────────────────────────────────────
     _print_startup_status(orch)
 
-    # ── REPL ─────────────────────────────────────────────────────────────────
     try:
         _run_repl(orch, show_metadata=args.show_metadata)
     except KeyboardInterrupt:
-        # Second Ctrl+C during REPL (first is handled inside _run_repl)
         print()
         _handle_exit()
 

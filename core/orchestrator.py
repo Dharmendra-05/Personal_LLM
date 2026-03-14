@@ -158,11 +158,6 @@ class OrchestratorResponse:
         completion_tokens: Token count of the completion (provider-reported).
         success: ``True`` if generation completed without error.
         error: Error message string if ``success`` is ``False``.
-
-    Example:
-        >>> resp = orchestrator.process_query("What is RAG?")
-        >>> print(resp.text)
-        >>> print(f"Mode: {resp.route_mode.name}, chunks: {resp.rag_context_used}")
     """
 
     text: str
@@ -200,7 +195,7 @@ class SystemOrchestrator:
         model_configs_dir: Path to the YAML model configs directory.
             Defaults to ``"models/model_configs"``.
         data_dir: Path to the ``.txt`` source documents directory.
-            Defaults to ``"data/documents"``.
+            Defaults to ``"assets/"``.
         chroma_persist_dir: Path for ChromaDB persistence.
             Defaults to ``"data/chroma_store"``.
         chroma_collection: ChromaDB collection name.
@@ -209,14 +204,12 @@ class SystemOrchestrator:
         default_model_name: Registry key of the default LLM model to use.
             When ``None``, the first registered model is used.
         rag_top_k: Number of context chunks retrieved per RAG query.
-        memory_turns: Number of conversation turns to keep in short-term
-            memory.
+        memory_turns: Number of conversation turns to keep in short-term memory.
         chunk_size: Document chunk size passed to ``DocumentLoader``.
         chunk_overlap: Document chunk overlap passed to ``DocumentLoader``.
-        rag_threshold: Router RAG eligibility score threshold.
-        code_threshold: Router CODE eligibility score threshold.
-        auto_index: If ``True`` (default), index documents on first startup
-            if the collection is empty.
+        advanced_threshold: Router ADVANCED eligibility score threshold.
+        auto_index: If ``True`` (default), index documents on first
+            PERSONAL_MEMORY query if the collection is empty.
 
     Raises:
         PersonalLLMException: If any subsystem fails to initialise.
@@ -267,6 +260,9 @@ class SystemOrchestrator:
         )
         self._auto_indexed: bool = False  # Track if auto-index has been attempted
 
+        # One-time warning flags — suppresses per-query log spam
+        self._advanced_api_warning_shown: bool = False
+
         logger.info(
             "SystemOrchestrator: starting up "
             "(model_configs=%s, data_dir=%s, rag_top_k=%d, memory=%d)",
@@ -285,39 +281,56 @@ class SystemOrchestrator:
     # Public interface
     # ------------------------------------------------------------------
 
+    def route_query(self, query: str) -> RoutingDecision:
+        """Classify *query* without executing any LLM call.
+
+        Exposed so the CLI can preview the routing decision (e.g. to show a
+        "Thinking …" indicator) **without** triggering a second route call
+        inside :meth:`process_query`.
+
+        Args:
+            query: Raw user input string.
+
+        Returns:
+            A :class:`RoutingDecision` from the underlying :class:`QueryRouter`.
+        """
+        return self._router.route(query)
+
     def process_query(
         self,
         query: str,
         model_name: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        decision: RoutingDecision | None = None,
     ) -> OrchestratorResponse:
         """Process a single user query through the full orchestration pipeline.
 
         Steps performed:
 
-        1. Route the query to ``RAG``, ``CODE``, or ``CHAT``.
-        2. If ``RAG``: retrieve relevant context from the vector store.
-        3. Build the appropriate system prompt (with history and context).
-        4. Construct a :class:`~models.base.GenerationRequest`.
-        5. Dispatch to the LLM client and capture the response.
-        6. Update conversation history.
-        7. Return a structured :class:`OrchestratorResponse`.
+        1. Route the query (or accept a pre-computed :class:`RoutingDecision`
+           from the caller — avoids the double-route penalty when the CLI
+           already called :meth:`route_query`).
+        2. Trigger deferred auto-index *only* for ``PERSONAL_MEMORY`` queries.
+        3. If ``PERSONAL_MEMORY``: retrieve relevant context from the vector store.
+        4. Build the appropriate system prompt (with history and context).
+        5. Construct a :class:`~models.base.GenerationRequest`.
+        6. Dispatch to the LLM client and capture the response.
+        7. Update conversation history.
+        8. Return a structured :class:`OrchestratorResponse`.
 
         Args:
             query: The user's input string.  Must be non-empty.
             model_name: Override the default model for this query.
             temperature: Override the default temperature for this query.
             max_tokens: Override the default max tokens for this query.
+            decision: Optional pre-computed routing decision.  When provided
+                the router is **not** called again, eliminating the double-
+                route log entries visible in previous sessions.
 
         Returns:
             An :class:`OrchestratorResponse` — always returned, never raises.
             Check ``response.success`` and ``response.error`` for failure.
-
-        Example:
-            >>> resp = orchestrator.process_query("How does chromadb work?")
-            >>> if resp.success:
-            ...     print(resp.text)
         """
         if not query or not query.strip():
             return self._error_response(
@@ -334,22 +347,20 @@ class SystemOrchestrator:
 
         wall_start: float = time.perf_counter()
 
-        # --- Step 0: Defered Auto-Index ---
-        if self._auto_index and not self._auto_indexed:
-            self._auto_index_if_empty()
+        # --- Step 1: Route (skip if caller already routed) ---
+        if decision is None:
+            try:
+                decision = self._router.route(query)
+            except Exception as exc:
+                logger.error("Router failed: %s", exc)
+                decision = RoutingDecision(
+                    mode=RouteMode.PERSONAL_MEMORY,
+                    confidence=0.0,
+                    scores={},
+                    matched_signals=["fallback:router_error"],
+                    query_preview=query[:80],
+                )
 
-        # --- Step 1: Route ---
-        try:
-            decision: RoutingDecision = self._router.route(query)
-        except Exception as exc:
-            logger.error("Router failed: %s", exc)
-            decision = RoutingDecision(
-                mode=RouteMode.PERSONAL_MEMORY,
-                confidence=0.0,
-                scores={},
-                matched_signals=["fallback:router_error"],
-                query_preview=query[:80],
-            )
         logger.info(
             "process_query(): mode=%s conf=%.2f | query=%r",
             decision.mode.name,
@@ -357,27 +368,33 @@ class SystemOrchestrator:
             query[:60],
         )
 
-        # --- Step 2: Retrieve context (PERSONAL_MEMORY only) ---
+        # --- Step 2: Deferred Auto-Index (PERSONAL_MEMORY only) ---
+        # GENERAL_CHAT queries never need the vector store — do not pay the
+        # ChromaDB + embedding model cold-start cost for simple conversations.
+        if (
+            self._auto_index
+            and not self._auto_indexed
+            and decision.mode == RouteMode.PERSONAL_MEMORY
+        ):
+            self._auto_index_if_empty()
+
+        # --- Step 3: Retrieve context (PERSONAL_MEMORY only) ---
         context_chunks: list[dict[str, Any]] = []
         if decision.mode == RouteMode.PERSONAL_MEMORY and self._vector_store is not None:
             context_chunks = self._retrieve_context(query)
-        elif decision.mode == RouteMode.GENERAL_CHAT:
-            # Skip context retrieval for general chat/greetings
-            context_chunks = []
 
-        # --- Step 3: Build system prompt ---
+        # --- Step 4: Build system prompt ---
         system_prompt: str = self._build_system_prompt(
             mode=decision.mode,
             context_chunks=context_chunks,
         )
 
-        # --- Step 4: Build prompt string ---
+        # --- Step 5: Build prompt string ---
         prompt: str = self._build_prompt(query)
 
-        # --- Step 5: Dispatch to LLM ---
-        # Dynamic Model Hierarchy: 
-        # Advanced questions let the Registry compute the Priority Fallback Chain ("auto-advanced").
-        # Personal memory questions always use the local Ollama model.
+        # --- Step 6: Select model ---
+        # ADVANCED queries → auto-advanced priority chain via ModelRegistry.
+        # All other modes → configured default (local Ollama).
         if decision.mode == RouteMode.ADVANCED_KNOWLEDGE:
             target_model = "auto-advanced"
         else:
@@ -409,21 +426,25 @@ class SystemOrchestrator:
             # --- Agentic Tool Execution Loop ---
             # Maximum of 5 consecutive tool execution turns to prevent infinite loops
             turn_count = 0
-            while gen_response.finish_reason == "tool_calls" and gen_response.tool_calls and turn_count < 5:
+            while (
+                gen_response.finish_reason == "tool_calls"
+                and gen_response.tool_calls
+                and turn_count < 5
+            ):
                 turn_count += 1
-                
+
                 # 1. Append the model's tool calls to the history context
                 messages.append({
                     "role": "assistant",
                     "content": gen_response.text or "",
-                    "tool_calls": gen_response.tool_calls
+                    "tool_calls": gen_response.tool_calls,
                 })
-                
+
                 # 2. Execute each requested tool locally
                 for tcall in gen_response.tool_calls:
                     func_name = tcall.get("function", {}).get("name")
                     args = tcall.get("function", {}).get("arguments", {})
-                    
+
                     logger.info("Executing Tool: %s(args=%r)", func_name, args)
                     if func_name in TOOL_REGISTRY:
                         try:
@@ -433,13 +454,13 @@ class SystemOrchestrator:
                             result = f"Error executing tool {func_name}: {e}"
                     else:
                         result = f"Error: Tool {func_name} not found in the registry."
-                    
+
                     # 3. Append the execution result to the history context
                     messages.append({
                         "role": "tool",
-                        "content": str(result)
+                        "content": str(result),
                     })
-                
+
                 # 4. Fire the context back to the LLM so it can answer the user
                 request_kwargs["messages"] = messages
                 gen_request = GenerationRequest(**request_kwargs)
@@ -463,7 +484,7 @@ class SystemOrchestrator:
 
         wall_elapsed: float = time.perf_counter() - wall_start
 
-        # --- Step 6: Update history ---
+        # --- Step 7: Update history ---
         self._history.append(
             ConversationTurn(role="user", content=query, route_mode=decision.mode)
         )
@@ -476,7 +497,7 @@ class SystemOrchestrator:
                 )
             )
 
-        # --- Step 7: Build response ---
+        # --- Step 8: Build response ---
         if gen_response is not None:
             return OrchestratorResponse(
                 text=gen_response.text,
@@ -525,7 +546,6 @@ class SystemOrchestrator:
         )
         start: float = time.perf_counter()
 
-        # Import here to avoid circular imports and allow lazy loading
         from core.knowledge_base.document_loader import DocumentLoader  # noqa: PLC0415
 
         loader = DocumentLoader(
@@ -564,11 +584,7 @@ class SystemOrchestrator:
         return result
 
     def list_models(self) -> list[dict[str, Any]]:
-        """Return summary metadata for all registered models.
-
-        Returns:
-            List of dicts from :meth:`~models.registry.ModelRegistry.list_model_details`.
-        """
+        """Return summary metadata for all registered models."""
         return self._registry.list_model_details()
 
     def get_collection_stats(self) -> dict[str, Any]:
@@ -588,25 +604,16 @@ class SystemOrchestrator:
         }
 
     def clear_history(self) -> None:
-        """Wipe the in-memory conversation history.
-
-        Useful when the user wants to start a fresh conversation without
-        restarting the process.
-        """
+        """Wipe the in-memory conversation history."""
         self._history.clear()
         logger.info("SystemOrchestrator: conversation history cleared.")
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Return the current conversation history as a list of dicts.
-
-        Returns:
-            List of ``{"role": str, "content": str, "mode": str}`` dicts,
-            ordered oldest-first.
-        """
+        """Return the current conversation history as a list of dicts."""
         return [
             {
                 "role": t.role,
-                "content": t.content[:200],   # truncate for safety
+                "content": t.content[:200],
                 "mode": t.route_mode.name,
                 "timestamp": t.timestamp,
             }
@@ -618,29 +625,20 @@ class SystemOrchestrator:
 
         Returns:
             Dict mapping subsystem names to boolean health status.
-
-        Example:
-            >>> orchestrator.health_check()
-            {'registry': True, 'vector_store': True, 'default_model': True}
         """
         status: dict[str, bool] = {}
 
-        # Registry
         status["registry"] = len(self._registry) > 0
 
-        # Vector store
         try:
-            # Only trigger a full health check if already loaded
             if self._vector_store.is_loaded:
                 self._vector_store.collection_count()
                 status["vector_store"] = True
             else:
-                # If not loaded, check if the directory exists (basic health)
                 status["vector_store"] = self._vector_store.persist_dir.exists()
         except Exception:
             status["vector_store"] = False
 
-        # Default model connectivity
         try:
             model_name = self._default_model_name or self._first_model()
             if model_name:
@@ -658,15 +656,13 @@ class SystemOrchestrator:
     # ------------------------------------------------------------------
 
     def _initialise_registry(self) -> None:
-        """Load the ModelRegistry from YAML config files.
-
-        Raises:
-            PersonalLLMException: If the registry fails to load.
-        """
+        """Load the ModelRegistry from YAML config files."""
         from models.registry import ModelRegistry  # noqa: PLC0415
 
-        logger.debug("SystemOrchestrator: loading ModelRegistry from %s",
-                     self._model_configs_dir)
+        logger.debug(
+            "SystemOrchestrator: loading ModelRegistry from %s",
+            self._model_configs_dir,
+        )
         try:
             self._registry = ModelRegistry(
                 configs_dir=self._model_configs_dir,
@@ -697,11 +693,7 @@ class SystemOrchestrator:
         )
 
     def _initialise_vector_store(self) -> None:
-        """Initialise the ChromaDB vector store and embedding model.
-
-        Raises:
-            VectorStoreError: If ChromaDB or the embedding model fails to init.
-        """
+        """Initialise the ChromaDB vector store (lazy — no I/O until first use)."""
         from core.knowledge_base.vector_store import VectorStore  # noqa: PLC0415
 
         logger.debug(
@@ -718,21 +710,21 @@ class SystemOrchestrator:
             device=self._embedding_device,
             top_k=self.rag_top_k,
         )
-        logger.info(
-            "SystemOrchestrator: VectorStore initialized (lazy)."
-        )
+        logger.info("SystemOrchestrator: VectorStore initialized (lazy).")
 
     def _auto_index_if_empty(self) -> None:
-        """Index documents on first launch if the collection is empty.
+        """Index documents on first PERSONAL_MEMORY query if the collection is empty.
+
+        This is intentionally deferred — GENERAL_CHAT queries never pay
+        the ChromaDB + embedding model cold-start cost.
         """
         if self._auto_indexed:
             return
         self._auto_indexed = True
 
         try:
-            # This will trigger the lazy load of ChromaDB client/collection
             count: int = self._vector_store.collection_count()
-            
+
             if count == 0:
                 if self._data_dir.exists():
                     logger.info(
@@ -777,8 +769,7 @@ class SystemOrchestrator:
             query: The user's query string.
 
         Returns:
-            List of result dicts (from :meth:`~core.knowledge_base.vector_store.SearchResult.to_dict`).
-            Returns an empty list on any retrieval error.
+            List of result dicts.  Returns an empty list on any retrieval error.
         """
         try:
             results = self._vector_store.similarity_search(
@@ -816,15 +807,7 @@ class SystemOrchestrator:
         mode: RouteMode,
         context_chunks: list[dict[str, Any]],
     ) -> str:
-        """Assemble the system prompt for the given routing mode.
-
-        Args:
-            mode: The routing mode that determined processing path.
-            context_chunks: RAG context chunks (empty for non-RAG modes).
-
-        Returns:
-            Fully assembled system prompt string.
-        """
+        """Assemble the system prompt for the given routing mode."""
         history_block: str = self._format_history_block()
 
         if mode == RouteMode.PERSONAL_MEMORY:
@@ -839,35 +822,11 @@ class SystemOrchestrator:
             return _SYSTEM_PROMPT_CHAT.format(history=history_block)
 
     def _build_prompt(self, query: str) -> str:
-        """Build the user-facing prompt from the raw query.
-
-        Currently a pass-through, but kept as a named method so future steps
-        (query rewriting, spell correction, chain-of-thought injection) have
-        a clean extension point.
-
-        Args:
-            query: Raw user input.
-
-        Returns:
-            Prompt string sent to the LLM.
-        """
+        """Build the user-facing prompt from the raw query."""
         return query.strip()
 
-    def _format_context_block(
-        self, chunks: list[dict[str, Any]]
-    ) -> str:
-        """Serialise RAG context chunks into an annotated text block.
-
-        Each chunk is prefixed with its source filename and similarity score
-        so the model (and the user in debug mode) can see provenance.
-
-        Args:
-            chunks: List of :meth:`~core.knowledge_base.vector_store.SearchResult.to_dict`
-                results.
-
-        Returns:
-            Multi-line context string.
-        """
+    def _format_context_block(self, chunks: list[dict[str, Any]]) -> str:
+        """Serialise RAG context chunks into an annotated text block."""
         if not chunks:
             return ""
 
@@ -883,19 +842,13 @@ class SystemOrchestrator:
         return _CONTEXT_SEPARATOR.join(parts)
 
     def _format_history_block(self) -> str:
-        """Serialise recent conversation history for inclusion in system prompt.
-
-        Returns:
-            A formatted string like ``"\n\nConversation so far:\n[user]: ...\n[assistant]: ..."``
-            or empty string if history is empty.
-        """
+        """Serialise recent conversation history for inclusion in system prompt."""
         if not self._history:
             return ""
 
         lines: list[str] = ["\n\nConversation so far:"]
         for turn in self._history:
             prefix: str = "[user]" if turn.role == "user" else "[assistant]"
-            # Truncate very long turns to avoid bloating the context window
             content: str = turn.content[:300]
             if len(turn.content) > 300:
                 content += " [...]"
@@ -920,18 +873,7 @@ class SystemOrchestrator:
         model_name: str = "unknown",
         duration_seconds: float = 0.0,
     ) -> OrchestratorResponse:
-        """Construct a failed :class:`OrchestratorResponse`.
-
-        Args:
-            query: The query that caused the failure.
-            error: Human-readable error description.
-            decision: The routing decision (may be a fallback decision).
-            model_name: Model that was targeted.
-            duration_seconds: Elapsed time before failure.
-
-        Returns:
-            An :class:`OrchestratorResponse` with ``success=False``.
-        """
+        """Construct a failed :class:`OrchestratorResponse`."""
         logger.warning(
             "SystemOrchestrator: error response for query=%r error=%s",
             query[:60],
