@@ -9,43 +9,18 @@ every user turn.  All business logic lives here; the CLI handles only I/O.
 
 Responsibilities
 ----------------
-1. **Bootstrap** — Load settings, initialise the model registry, vector store,
-   document loader, and query router in the correct order.
-2. **Routing** — Delegate query classification to :class:`~core.router.QueryRouter`
-   and select the appropriate execution path.
-3. **Retrieval** — For ``RAG`` queries, search the vector store, collect the
-   top-k chunks, and inject them as context into the prompt.
-4. **Conversation memory** — Maintain a rolling window of the last
-   ``memory_turns`` (default 5) user/assistant exchanges.  The window is
-   serialised into the system prompt so the model is always aware of recent
-   context.
-5. **Generation** — Build a typed :class:`~models.base.GenerationRequest`,
-   dispatch it to the correct :class:`~models.base.BaseLLMClient`, and return
-   a structured :class:`OrchestratorResponse`.
-6. **Lifecycle management** — Provide :meth:`reload_knowledge_base` for
-   hot-reloading indexed documents without restarting the process.
-
-Prompt templates
-----------------
-Three system-prompt templates are defined as module-level constants:
-
-* :data:`_SYSTEM_PROMPT_CHAT` — General assistant persona.
-* :data:`_SYSTEM_PROMPT_CODE` — Code-expert persona with formatting guidance.
-* :data:`_SYSTEM_PROMPT_RAG`  — Evidence-grounded persona with injected context.
-
-Each template supports ``{context}`` and ``{history}`` placeholder substitution.
-
-Error handling
---------------
-All domain exceptions propagate to the caller as :class:`OrchestratorResponse`
-objects with ``success=False`` and a populated ``error`` field.  The CLI
-never sees raw exceptions from this layer.
-
-Threading
----------
-The orchestrator is **not** thread-safe by default.  The conversation history
-deque is mutated on every turn.  If concurrent calls are required, wrap in a
-per-caller instance or add external locking.
+1. Bootstrap — Load settings, model registry, vector store, document loader,
+   and query router in the correct order.
+2. Routing — Delegate classification to QueryRouter; accept pre-computed
+   decisions to avoid the double-route log entries seen in earlier sessions.
+3. Streaming — Fast path via stream_query() for GENERAL_CHAT and
+   ADVANCED_KNOWLEDGE; tokens arrive in ~1-2 s vs ~40 s blocking.
+4. Retrieval — For PERSONAL_MEMORY queries search the vector store, collect
+   top-k chunks, and inject them as context.
+5. Conversation memory — Rolling window of last memory_turns exchanges.
+6. Generation — Build GenerationRequest, dispatch to LLM, return
+   OrchestratorResponse.
+7. Lifecycle — reload_knowledge_base() for hot-reloading without restart.
 """
 
 from __future__ import annotations
@@ -54,7 +29,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Iterator
 
 from core.exceptions import (
     LLMInferenceError,
@@ -67,26 +42,15 @@ from core.tools import TOOL_DEFINITIONS, TOOL_REGISTRY
 from core.utils.logger import get_logger
 from models.base import GenerationRequest, GenerationResponse
 
-# ---------------------------------------------------------------------------
-# Module logger
-# ---------------------------------------------------------------------------
-
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Maximum number of conversation turns kept in short-term memory.
 _DEFAULT_MEMORY_TURNS: Final[int] = 5
-
-#: Maximum number of RAG context chunks injected per query.
 _DEFAULT_RAG_TOP_K: Final[int] = 3
-
-#: Maximum character length of a single RAG context chunk included in prompt.
 _MAX_CONTEXT_CHUNK_CHARS: Final[int] = 600
-
-#: Separator inserted between RAG context chunks in the prompt.
 _CONTEXT_SEPARATOR: Final[str] = "\n---\n"
 
 # ---------------------------------------------------------------------------
@@ -127,14 +91,7 @@ CONTEXT:
 
 @dataclass(slots=True)
 class ConversationTurn:
-    """A single user/assistant exchange stored in conversation memory.
-
-    Attributes:
-        role: Either ``"user"`` or ``"assistant"``.
-        content: The text of the turn.
-        route_mode: The routing mode that was used for this turn.
-        timestamp: Unix timestamp of when this turn was created.
-    """
+    """A single user/assistant exchange stored in conversation memory."""
 
     role: str
     content: str
@@ -144,21 +101,7 @@ class ConversationTurn:
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorResponse:
-    """Immutable result of a single :meth:`SystemOrchestrator.process_query` call.
-
-    Attributes:
-        text: The LLM-generated response text.  Empty string on failure.
-        route_mode: The routing mode that was applied.
-        model_name: The model that generated the response.
-        decision: The full :class:`~core.router.RoutingDecision`.
-        rag_context_used: Number of RAG context chunks injected.  ``0`` for
-            non-RAG queries.
-        duration_seconds: Wall-clock time from query receipt to response.
-        prompt_tokens: Token count of the prompt (provider-reported).
-        completion_tokens: Token count of the completion (provider-reported).
-        success: ``True`` if generation completed without error.
-        error: Error message string if ``success`` is ``False``.
-    """
+    """Immutable result of a single process_query() call."""
 
     text: str
     route_mode: RouteMode
@@ -189,36 +132,7 @@ class OrchestratorResponse:
 
 
 class SystemOrchestrator:
-    """Coordinates all subsystems to process user queries end-to-end.
-
-    Args:
-        model_configs_dir: Path to the YAML model configs directory.
-            Defaults to ``"models/model_configs"``.
-        data_dir: Path to the ``.txt`` source documents directory.
-            Defaults to ``"assets/"``.
-        chroma_persist_dir: Path for ChromaDB persistence.
-            Defaults to ``"data/chroma_store"``.
-        chroma_collection: ChromaDB collection name.
-        embedding_model: Sentence-transformer model identifier.
-        embedding_device: Compute device (``"cpu"`` / ``"cuda"`` / ``"mps"``).
-        default_model_name: Registry key of the default LLM model to use.
-            When ``None``, the first registered model is used.
-        rag_top_k: Number of context chunks retrieved per RAG query.
-        memory_turns: Number of conversation turns to keep in short-term memory.
-        chunk_size: Document chunk size passed to ``DocumentLoader``.
-        chunk_overlap: Document chunk overlap passed to ``DocumentLoader``.
-        advanced_threshold: Router ADVANCED eligibility score threshold.
-        auto_index: If ``True`` (default), index documents on first
-            PERSONAL_MEMORY query if the collection is empty.
-
-    Raises:
-        PersonalLLMException: If any subsystem fails to initialise.
-
-    Example:
-        >>> orch = SystemOrchestrator()
-        >>> resp = orch.process_query("Explain what embeddings are")
-        >>> print(resp.text)
-    """
+    """Coordinates all subsystems to process user queries end-to-end."""
 
     def __init__(
         self,
@@ -249,32 +163,20 @@ class SystemOrchestrator:
         self._chunk_overlap: int = chunk_overlap
         self._auto_index: bool = auto_index
 
-        # Short-term conversation memory (bounded deque)
         self._history: deque[ConversationTurn] = deque(maxlen=memory_turns * 2)
-
-        # Subsystem references (populated in _initialise_*)
-        self._registry: Any = None      # ModelRegistry
-        self._vector_store: Any = None  # VectorStore
-        self._router: QueryRouter = QueryRouter(
-            advanced_threshold=advanced_threshold,
-        )
-        self._auto_indexed: bool = False  # Track if auto-index has been attempted
-
-        # One-time warning flags — suppresses per-query log spam
-        self._advanced_api_warning_shown: bool = False
+        self._registry: Any = None
+        self._vector_store: Any = None
+        self._router: QueryRouter = QueryRouter(advanced_threshold=advanced_threshold)
+        self._auto_indexed: bool = False
 
         logger.info(
             "SystemOrchestrator: starting up "
             "(model_configs=%s, data_dir=%s, rag_top_k=%d, memory=%d)",
-            self._model_configs_dir,
-            self._data_dir,
-            self.rag_top_k,
-            self.memory_turns,
+            self._model_configs_dir, self._data_dir, self.rag_top_k, self.memory_turns,
         )
 
         self._initialise_registry()
         self._initialise_vector_store()
-
         logger.info("SystemOrchestrator: ready (vector store deferred).")
 
     # ------------------------------------------------------------------
@@ -284,17 +186,125 @@ class SystemOrchestrator:
     def route_query(self, query: str) -> RoutingDecision:
         """Classify *query* without executing any LLM call.
 
-        Exposed so the CLI can preview the routing decision (e.g. to show a
-        "Thinking …" indicator) **without** triggering a second route call
-        inside :meth:`process_query`.
-
-        Args:
-            query: Raw user input string.
-
-        Returns:
-            A :class:`RoutingDecision` from the underlying :class:`QueryRouter`.
+        Exposed so the CLI can inspect the routing decision once and pass it
+        directly to stream_query() or process_query() — eliminating the
+        double-route log entries visible in earlier sessions.
         """
         return self._router.route(query)
+
+    def stream_query(
+        self,
+        query: str,
+        model_name: str | None = None,
+        decision: RoutingDecision | None = None,
+    ) -> Iterator[str]:
+        """Stream response tokens for GENERAL_CHAT and ADVANCED_KNOWLEDGE queries.
+
+        This is the **fast path**.  Tokens are yielded as they arrive from
+        Ollama so the first word appears in ~1–2 s instead of ~40 s.
+
+        For PERSONAL_MEMORY queries — which need RAG retrieval and may trigger
+        tool-call loops — use process_query() instead.
+
+        Args:
+            query: The user's input string.
+            model_name: Optional model override.
+            decision: Pre-computed RoutingDecision from route_query().
+                When provided the router is not called again.
+
+        Yields:
+            str: Text chunks as they arrive from the LLM.  On error an
+                ``[Error: ...]`` string is yielded so the terminal always
+                receives something to display.
+        """
+        if not query or not query.strip():
+            yield "[Error: query must not be empty]"
+            return
+
+        if decision is None:
+            try:
+                decision = self._router.route(query)
+            except Exception as exc:
+                logger.error("stream_query(): router failed: %s", exc)
+                decision = RoutingDecision(
+                    mode=RouteMode.GENERAL_CHAT,
+                    confidence=0.0,
+                    scores={},
+                    matched_signals=["fallback:router_error"],
+                    query_preview=query[:80],
+                )
+
+        logger.info(
+            "stream_query(): mode=%s conf=%.2f | query=%r",
+            decision.mode.name, decision.confidence, query[:60],
+        )
+
+        system_prompt: str = self._build_system_prompt(
+            mode=decision.mode, context_chunks=[]
+        )
+        prompt: str = self._build_prompt(query)
+
+        target_model = (
+            "auto-advanced"
+            if decision.mode == RouteMode.ADVANCED_KNOWLEDGE
+            else (model_name or self._default_model_name or self._first_model())
+        )
+
+        try:
+            client = self._registry.get_model(target_model)
+        except Exception as exc:
+            logger.error("stream_query(): failed to get model %r: %s", target_model, exc)
+            yield f"[Error: could not load model '{target_model}' — {exc}]"
+            return
+
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        request = GenerationRequest(messages=messages)
+        accumulated: list[str] = []
+
+        try:
+            if hasattr(client, "stream_generate"):
+                for chunk in client.stream_generate(request):
+                    accumulated.append(chunk)
+                    yield chunk
+            else:
+                # Fallback for API clients without streaming support.
+                logger.debug(
+                    "stream_query(): %s has no stream_generate — "
+                    "falling back to blocking generate()",
+                    type(client).__name__,
+                )
+                resp: GenerationResponse = client.generate(request)
+                accumulated.append(resp.text)
+                yield resp.text
+
+        except OllamaConnectionError as exc:
+            logger.error("stream_query(): OllamaConnectionError: %s", exc)
+            yield (
+                f"\n[Error: Cannot reach Ollama. "
+                f"Is `ollama serve` running? ({exc.error_code})]"
+            )
+        except LLMInferenceError as exc:
+            logger.error("stream_query(): LLMInferenceError: %s", exc)
+            yield f"\n[Error: LLM inference failed — {exc.message}]"
+        except Exception as exc:
+            logger.exception("stream_query(): unexpected error")
+            yield f"\n[Error: Unexpected error — {exc}]"
+
+        # Update conversation history with the full accumulated response.
+        full_text = "".join(accumulated)
+        self._history.append(
+            ConversationTurn(role="user", content=query, route_mode=decision.mode)
+        )
+        if full_text:
+            self._history.append(
+                ConversationTurn(
+                    role="assistant", content=full_text, route_mode=decision.mode
+                )
+            )
 
     def process_query(
         self,
@@ -304,33 +314,21 @@ class SystemOrchestrator:
         max_tokens: int | None = None,
         decision: RoutingDecision | None = None,
     ) -> OrchestratorResponse:
-        """Process a single user query through the full orchestration pipeline.
+        """Blocking pipeline for PERSONAL_MEMORY (RAG + tool-call loop).
 
-        Steps performed:
-
-        1. Route the query (or accept a pre-computed :class:`RoutingDecision`
-           from the caller — avoids the double-route penalty when the CLI
-           already called :meth:`route_query`).
-        2. Trigger deferred auto-index *only* for ``PERSONAL_MEMORY`` queries.
-        3. If ``PERSONAL_MEMORY``: retrieve relevant context from the vector store.
-        4. Build the appropriate system prompt (with history and context).
-        5. Construct a :class:`~models.base.GenerationRequest`.
-        6. Dispatch to the LLM client and capture the response.
-        7. Update conversation history.
-        8. Return a structured :class:`OrchestratorResponse`.
+        For GENERAL_CHAT and ADVANCED_KNOWLEDGE use stream_query() — it
+        delivers the first token ~20-40× faster.
 
         Args:
-            query: The user's input string.  Must be non-empty.
+            query: The user's input string.
             model_name: Override the default model for this query.
-            temperature: Override the default temperature for this query.
-            max_tokens: Override the default max tokens for this query.
-            decision: Optional pre-computed routing decision.  When provided
-                the router is **not** called again, eliminating the double-
-                route log entries visible in previous sessions.
+            temperature: Override the default temperature.
+            max_tokens: Override the default max tokens.
+            decision: Pre-computed RoutingDecision — skips the internal
+                router call when the CLI already called route_query().
 
         Returns:
-            An :class:`OrchestratorResponse` — always returned, never raises.
-            Check ``response.success`` and ``response.error`` for failure.
+            OrchestratorResponse — always returned, never raises.
         """
         if not query or not query.strip():
             return self._error_response(
@@ -347,7 +345,7 @@ class SystemOrchestrator:
 
         wall_start: float = time.perf_counter()
 
-        # --- Step 1: Route (skip if caller already routed) ---
+        # Step 1: Route
         if decision is None:
             try:
                 decision = self._router.route(query)
@@ -363,14 +361,11 @@ class SystemOrchestrator:
 
         logger.info(
             "process_query(): mode=%s conf=%.2f | query=%r",
-            decision.mode.name,
-            decision.confidence,
-            query[:60],
+            decision.mode.name, decision.confidence, query[:60],
         )
 
-        # --- Step 2: Deferred Auto-Index (PERSONAL_MEMORY only) ---
-        # GENERAL_CHAT queries never need the vector store — do not pay the
-        # ChromaDB + embedding model cold-start cost for simple conversations.
+        # Step 2: Deferred auto-index — only for PERSONAL_MEMORY queries.
+        # GENERAL_CHAT never needs the vector store; don't pay cold-start cost.
         if (
             self._auto_index
             and not self._auto_indexed
@@ -378,27 +373,23 @@ class SystemOrchestrator:
         ):
             self._auto_index_if_empty()
 
-        # --- Step 3: Retrieve context (PERSONAL_MEMORY only) ---
+        # Step 3: Retrieve context
         context_chunks: list[dict[str, Any]] = []
         if decision.mode == RouteMode.PERSONAL_MEMORY and self._vector_store is not None:
             context_chunks = self._retrieve_context(query)
 
-        # --- Step 4: Build system prompt ---
+        # Step 4 & 5: Build prompts
         system_prompt: str = self._build_system_prompt(
-            mode=decision.mode,
-            context_chunks=context_chunks,
+            mode=decision.mode, context_chunks=context_chunks
         )
-
-        # --- Step 5: Build prompt string ---
         prompt: str = self._build_prompt(query)
 
-        # --- Step 6: Select model ---
-        # ADVANCED queries → auto-advanced priority chain via ModelRegistry.
-        # All other modes → configured default (local Ollama).
-        if decision.mode == RouteMode.ADVANCED_KNOWLEDGE:
-            target_model = "auto-advanced"
-        else:
-            target_model = model_name or self._default_model_name or self._first_model()
+        # Step 6: Select model and dispatch
+        target_model = (
+            "auto-advanced"
+            if decision.mode == RouteMode.ADVANCED_KNOWLEDGE
+            else (model_name or self._default_model_name or self._first_model())
+        )
 
         gen_response: GenerationResponse | None = None
         error_message: str = ""
@@ -406,7 +397,7 @@ class SystemOrchestrator:
         try:
             client = self._registry.get_model(target_model)
 
-            messages = []
+            messages: list[dict[str, Any]] = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
@@ -423,8 +414,7 @@ class SystemOrchestrator:
             gen_request = GenerationRequest(**request_kwargs)
             gen_response = client.generate(gen_request)
 
-            # --- Agentic Tool Execution Loop ---
-            # Maximum of 5 consecutive tool execution turns to prevent infinite loops
+            # Agentic tool-execution loop (max 5 turns)
             turn_count = 0
             while (
                 gen_response.finish_reason == "tool_calls"
@@ -432,19 +422,14 @@ class SystemOrchestrator:
                 and turn_count < 5
             ):
                 turn_count += 1
-
-                # 1. Append the model's tool calls to the history context
                 messages.append({
                     "role": "assistant",
                     "content": gen_response.text or "",
                     "tool_calls": gen_response.tool_calls,
                 })
-
-                # 2. Execute each requested tool locally
                 for tcall in gen_response.tool_calls:
                     func_name = tcall.get("function", {}).get("name")
                     args = tcall.get("function", {}).get("arguments", {})
-
                     logger.info("Executing Tool: %s(args=%r)", func_name, args)
                     if func_name in TOOL_REGISTRY:
                         try:
@@ -453,15 +438,8 @@ class SystemOrchestrator:
                             logger.error("Tool execution failed: %s", e)
                             result = f"Error executing tool {func_name}: {e}"
                     else:
-                        result = f"Error: Tool {func_name} not found in the registry."
-
-                    # 3. Append the execution result to the history context
-                    messages.append({
-                        "role": "tool",
-                        "content": str(result),
-                    })
-
-                # 4. Fire the context back to the LLM so it can answer the user
+                        result = f"Error: Tool {func_name} not found."
+                    messages.append({"role": "tool", "content": str(result)})
                 request_kwargs["messages"] = messages
                 gen_request = GenerationRequest(**request_kwargs)
                 gen_response = client.generate(gen_request)
@@ -484,20 +462,18 @@ class SystemOrchestrator:
 
         wall_elapsed: float = time.perf_counter() - wall_start
 
-        # --- Step 7: Update history ---
+        # Step 7: Update history
         self._history.append(
             ConversationTurn(role="user", content=query, route_mode=decision.mode)
         )
         if gen_response is not None:
             self._history.append(
                 ConversationTurn(
-                    role="assistant",
-                    content=gen_response.text,
-                    route_mode=decision.mode,
+                    role="assistant", content=gen_response.text, route_mode=decision.mode
                 )
             )
 
-        # --- Step 8: Build response ---
+        # Step 8: Return
         if gen_response is not None:
             return OrchestratorResponse(
                 text=gen_response.text,
@@ -511,38 +487,19 @@ class SystemOrchestrator:
                 success=True,
                 error="",
             )
-        else:
-            return self._error_response(
-                query=query,
-                error=error_message,
-                decision=decision,
-                model_name=target_model,
-                duration_seconds=wall_elapsed,
-            )
+        return self._error_response(
+            query=query,
+            error=error_message,
+            decision=decision,
+            model_name=target_model,
+            duration_seconds=wall_elapsed,
+        )
 
     def reload_knowledge_base(self, confirm_reindex: bool = True) -> dict[str, Any]:
-        """Re-scan the document directory and re-index all chunks.
-
-        This is the backend for the CLI ``/reload`` command.  Existing
-        documents with the same SHA-256 hash are skipped; only genuinely
-        new or modified chunks are added.
-
-        Args:
-            confirm_reindex: If ``True`` (default), proceeds with indexing.
-                Pass ``False`` to do a dry-run (scan only, no writes).
-
-        Returns:
-            A summary dict with keys: ``"files_found"``, ``"chunks_found"``,
-            ``"added"``, ``"skipped"``, ``"failed"``, ``"duration_seconds"``.
-
-        Raises:
-            PersonalLLMException: If document loading or indexing fails.
-        """
+        """Re-scan the document directory and re-index all chunks."""
         logger.info(
-            "SystemOrchestrator.reload_knowledge_base(): "
-            "scanning %s (reindex=%s)",
-            self._data_dir,
-            confirm_reindex,
+            "SystemOrchestrator.reload_knowledge_base(): scanning %s (reindex=%s)",
+            self._data_dir, confirm_reindex,
         )
         start: float = time.perf_counter()
 
@@ -555,7 +512,6 @@ class SystemOrchestrator:
             recursive=True,
             silent=True,
         )
-
         stats: dict[str, Any] = loader.get_stats()
         chunks = loader.load_and_chunk()
         chunk_dicts: list[dict[str, Any]] = [c.to_dict() for c in chunks]
@@ -568,7 +524,6 @@ class SystemOrchestrator:
             "failed": 0,
             "duration_seconds": 0.0,
         }
-
         if confirm_reindex and chunk_dicts:
             try:
                 index_result = self._vector_store.index_documents(chunk_dicts)
@@ -584,32 +539,19 @@ class SystemOrchestrator:
         return result
 
     def list_models(self) -> list[dict[str, Any]]:
-        """Return summary metadata for all registered models."""
         return self._registry.list_model_details()
 
     def get_collection_stats(self) -> dict[str, Any]:
-        """Return basic statistics about the vector store collection.
-
-        Returns:
-            Dict with ``"collection_name"`` and ``"document_count"`` keys.
-            ``document_count`` is -1 if the vector store is not yet loaded.
-        """
         count = -1
         if self._vector_store.is_loaded:
             count = self._vector_store.collection_count()
-
-        return {
-            "collection_name": self._chroma_collection,
-            "document_count": count,
-        }
+        return {"collection_name": self._chroma_collection, "document_count": count}
 
     def clear_history(self) -> None:
-        """Wipe the in-memory conversation history."""
         self._history.clear()
         logger.info("SystemOrchestrator: conversation history cleared.")
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Return the current conversation history as a list of dicts."""
         return [
             {
                 "role": t.role,
@@ -621,15 +563,8 @@ class SystemOrchestrator:
         ]
 
     def health_check(self) -> dict[str, bool]:
-        """Probe all subsystems and return a health status map.
-
-        Returns:
-            Dict mapping subsystem names to boolean health status.
-        """
         status: dict[str, bool] = {}
-
         status["registry"] = len(self._registry) > 0
-
         try:
             if self._vector_store.is_loaded:
                 self._vector_store.collection_count()
@@ -638,7 +573,6 @@ class SystemOrchestrator:
                 status["vector_store"] = self._vector_store.persist_dir.exists()
         except Exception:
             status["vector_store"] = False
-
         try:
             model_name = self._default_model_name or self._first_model()
             if model_name:
@@ -648,7 +582,6 @@ class SystemOrchestrator:
                 status["default_model"] = False
         except Exception:
             status["default_model"] = False
-
         return status
 
     # ------------------------------------------------------------------
@@ -656,18 +589,11 @@ class SystemOrchestrator:
     # ------------------------------------------------------------------
 
     def _initialise_registry(self) -> None:
-        """Load the ModelRegistry from YAML config files."""
         from models.registry import ModelRegistry  # noqa: PLC0415
 
-        logger.debug(
-            "SystemOrchestrator: loading ModelRegistry from %s",
-            self._model_configs_dir,
-        )
+        logger.debug("SystemOrchestrator: loading ModelRegistry from %s", self._model_configs_dir)
         try:
-            self._registry = ModelRegistry(
-                configs_dir=self._model_configs_dir,
-                auto_load=True,
-            )
+            self._registry = ModelRegistry(configs_dir=self._model_configs_dir, auto_load=True)
         except PersonalLLMException:
             raise
         except Exception as exc:
@@ -682,26 +608,19 @@ class SystemOrchestrator:
             if models:
                 self._default_model_name = models[0]
                 logger.info(
-                    "SystemOrchestrator: default model set to '%s'",
-                    self._default_model_name,
+                    "SystemOrchestrator: default model set to '%s'", self._default_model_name
                 )
-
         logger.info(
             "SystemOrchestrator: ModelRegistry loaded — %d model(s): %s",
-            len(self._registry),
-            self._registry.list_models(),
+            len(self._registry), self._registry.list_models(),
         )
 
     def _initialise_vector_store(self) -> None:
-        """Initialise the ChromaDB vector store (lazy — no I/O until first use)."""
         from core.knowledge_base.vector_store import VectorStore  # noqa: PLC0415
 
         logger.debug(
-            "SystemOrchestrator: initialising VectorStore "
-            "(model=%s, device=%s, persist=%s)",
-            self._embedding_model,
-            self._embedding_device,
-            self._chroma_persist_dir,
+            "SystemOrchestrator: initialising VectorStore (model=%s, device=%s, persist=%s)",
+            self._embedding_model, self._embedding_device, self._chroma_persist_dir,
         )
         self._vector_store = VectorStore(
             persist_dir=self._chroma_persist_dir,
@@ -713,18 +632,11 @@ class SystemOrchestrator:
         logger.info("SystemOrchestrator: VectorStore initialized (lazy).")
 
     def _auto_index_if_empty(self) -> None:
-        """Index documents on first PERSONAL_MEMORY query if the collection is empty.
-
-        This is intentionally deferred — GENERAL_CHAT queries never pay
-        the ChromaDB + embedding model cold-start cost.
-        """
         if self._auto_indexed:
             return
         self._auto_indexed = True
-
         try:
             count: int = self._vector_store.collection_count()
-
             if count == 0:
                 if self._data_dir.exists():
                     logger.info(
@@ -733,29 +645,23 @@ class SystemOrchestrator:
                     )
                     try:
                         result = self.reload_knowledge_base(confirm_reindex=True)
-                        logger.info(
-                            "SystemOrchestrator: auto-index complete: %s", result
-                        )
+                        logger.info("SystemOrchestrator: auto-index complete: %s", result)
                     except Exception as exc:
                         logger.error("SystemOrchestrator: auto-index failed: %s", exc)
                 else:
                     logger.info(
-                        "SystemOrchestrator: data_dir '%s' does not exist — "
-                        "skipping auto-index.",
+                        "SystemOrchestrator: data_dir '%s' does not exist — skipping.",
                         self._data_dir,
                     )
             else:
                 logger.info(
-                    "SystemOrchestrator: collection has %d docs — skipping auto-index.",
-                    count,
+                    "SystemOrchestrator: collection has %d docs — skipping auto-index.", count
                 )
-
         except Exception as exc:
             logger.error("Failed to check collection count for auto-index: %s", exc)
             from core.exceptions import PipelineError
             raise PipelineError(
-                message=f"Auto-index failed on startup: {exc}",
-                stage="bootstrap",
+                message=f"Auto-index failed on startup: {exc}", stage="bootstrap"
             ) from exc
 
     # ------------------------------------------------------------------
@@ -763,39 +669,26 @@ class SystemOrchestrator:
     # ------------------------------------------------------------------
 
     def _retrieve_context(self, query: str) -> list[dict[str, Any]]:
-        """Fetch the top-k semantically similar chunks for *query*.
-
-        Args:
-            query: The user's query string.
-
-        Returns:
-            List of result dicts.  Returns an empty list on any retrieval error.
-        """
         try:
             results = self._vector_store.similarity_search(
-                query=query,
-                k=self.rag_top_k,
-                min_score=0.1,
+                query=query, k=self.rag_top_k, min_score=0.1
             )
             logger.debug(
                 "_retrieve_context(): %d chunks retrieved (top score=%.3f)",
-                len(results),
-                results[0].score if results else 0.0,
+                len(results), results[0].score if results else 0.0,
             )
             return [r.to_dict() for r in results]
         except VectorStoreError as exc:
-            logger.error("_retrieve_context() failed with vector store error: %s", exc)
+            logger.error("_retrieve_context() vector store error: %s", exc)
             from core.exceptions import ContextRetrievalError
             raise ContextRetrievalError(
-                message=f"Retrieval failed due to vector store error: {exc}",
-                query=query,
+                message=f"Retrieval failed: {exc}", query=query
             ) from exc
         except Exception as exc:
             logger.error("_retrieve_context() unexpected error: %s", exc)
             from core.exceptions import ContextRetrievalError
             raise ContextRetrievalError(
-                message=f"Retrieval failed due to unexpected error: {exc}",
-                query=query,
+                message=f"Retrieval failed: {exc}", query=query
             ) from exc
 
     # ------------------------------------------------------------------
@@ -803,13 +696,9 @@ class SystemOrchestrator:
     # ------------------------------------------------------------------
 
     def _build_system_prompt(
-        self,
-        mode: RouteMode,
-        context_chunks: list[dict[str, Any]],
+        self, mode: RouteMode, context_chunks: list[dict[str, Any]]
     ) -> str:
-        """Assemble the system prompt for the given routing mode."""
         history_block: str = self._format_history_block()
-
         if mode == RouteMode.PERSONAL_MEMORY:
             context_text: str = self._format_context_block(context_chunks)
             return _SYSTEM_PROMPT_RAG.format(
@@ -822,38 +711,31 @@ class SystemOrchestrator:
             return _SYSTEM_PROMPT_CHAT.format(history=history_block)
 
     def _build_prompt(self, query: str) -> str:
-        """Build the user-facing prompt from the raw query."""
         return query.strip()
 
     def _format_context_block(self, chunks: list[dict[str, Any]]) -> str:
-        """Serialise RAG context chunks into an annotated text block."""
         if not chunks:
             return ""
-
         parts: list[str] = []
         for i, chunk in enumerate(chunks, start=1):
-            filename: str = str(chunk.get("metadata", {}).get("filename", "unknown"))
-            score: float = float(chunk.get("score", 0.0))
-            text: str = str(chunk.get("text", ""))[:_MAX_CONTEXT_CHUNK_CHARS]
+            filename = str(chunk.get("metadata", {}).get("filename", "unknown"))
+            score = float(chunk.get("score", 0.0))
+            text = str(chunk.get("text", ""))[:_MAX_CONTEXT_CHUNK_CHARS]
             parts.append(
                 f"[Excerpt {i} | source: {filename} | relevance: {score:.2f}]\n{text}"
             )
-
         return _CONTEXT_SEPARATOR.join(parts)
 
     def _format_history_block(self) -> str:
-        """Serialise recent conversation history for inclusion in system prompt."""
         if not self._history:
             return ""
-
         lines: list[str] = ["\n\nConversation so far:"]
         for turn in self._history:
-            prefix: str = "[user]" if turn.role == "user" else "[assistant]"
-            content: str = turn.content[:300]
+            prefix = "[user]" if turn.role == "user" else "[assistant]"
+            content = turn.content[:300]
             if len(turn.content) > 300:
                 content += " [...]"
             lines.append(f"{prefix}: {content}")
-
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -861,7 +743,6 @@ class SystemOrchestrator:
     # ------------------------------------------------------------------
 
     def _first_model(self) -> str:
-        """Return the name of the first registered model or empty string."""
         models = self._registry.list_models()
         return models[0] if models else ""
 
@@ -873,11 +754,8 @@ class SystemOrchestrator:
         model_name: str = "unknown",
         duration_seconds: float = 0.0,
     ) -> OrchestratorResponse:
-        """Construct a failed :class:`OrchestratorResponse`."""
         logger.warning(
-            "SystemOrchestrator: error response for query=%r error=%s",
-            query[:60],
-            error,
+            "SystemOrchestrator: error response for query=%r error=%s", query[:60], error
         )
         return OrchestratorResponse(
             text="",
@@ -890,10 +768,6 @@ class SystemOrchestrator:
             error=error,
         )
 
-
-# ---------------------------------------------------------------------------
-# Public re-export surface
-# ---------------------------------------------------------------------------
 
 __all__: list[str] = [
     "ConversationTurn",
