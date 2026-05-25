@@ -313,16 +313,40 @@ class SystemOrchestrator:
                 return
 
             except OllamaConnectionError as exc:
-                logger.warning(
-                    "stream_query(): Ollama unreachable (%s) — will try cloud fallback.",
+                # Only fall back to cloud when Ollama is genuinely unreachable:
+                #   OLLAMA_001 = ConnectionRefused (server not running)
+                #   OLLAMA_002 = Timeout (server hung / overloaded)
+                #
+                # OLLAMA_003 = Ollama IS running but returned non-2xx HTTP —
+                # model not pulled or wrong tag.  Do NOT fall back to cloud;
+                # surface the real error so the user knows what to fix.
+                _SERVER_DOWN_CODES = {"OLLAMA_001", "OLLAMA_002"}
+
+                if exc.error_code not in _SERVER_DOWN_CODES:
+                    logger.debug(
+                        "stream_query(): Ollama error %s — not a connection "
+                        "failure, skipping cloud fallback.",
+                        exc.error_code,
+                    )
+                    error_text = f"\n[Ollama error ({exc.error_code}): {exc.message}]"
+                    if exc.error_code == "OLLAMA_003":
+                        model_hint = self._default_model_name or "<model_tag>"
+                        error_text += (
+                            f"\n[Hint: model not found or not pulled yet. "
+                            f"Run: ollama pull {model_hint}]"
+                        )
+                    yield error_text
+                    return
+
+                # OLLAMA_001 / OLLAMA_002 — server truly down, try cloud.
+                logger.debug(
+                    "stream_query(): Ollama server unreachable (%s) — "
+                    "trying cloud fallback.",
                     exc.error_code,
                 )
                 ollama_failed = True
-                # Yield a visible hint before the fallback response starts.
                 if not is_fallback:
-                    yield (
-                        "\n[Ollama unreachable — switching to cloud model …]\n\n"
-                    )
+                    yield "\n[Ollama unreachable — switching to cloud model …]\n\n"
                     continue   # retry loop with auto-advanced
 
             except LLMInferenceError as exc:
