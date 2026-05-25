@@ -1,0 +1,12 @@
+Building an Anonymous Account for mails
+---------------------------------------
+
+1. Go to Proton Mail.
+2. Proton mail is a secure mail organization that provides 500mb to 1gigs of space in their free tier. 
+3. You can select the premium ones as well.
+4. Since I am creating an alias account - 
+	User Name - Pro Linux Admin
+	User Email - pro.linux.admin@proton.me
+	User Password - ******************
+5. There you go - you got your free private email. You may need to complete 5 tasks so as to get upgraded to 	1 gigs of space.
+6. You can also enable seamless email forwarding from your pre-existing email securely.
