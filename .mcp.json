@@ -1,0 +1,46 @@
+{
+  "mcpServers": {
+    "21st-dev-magic": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@21st-dev/magic-mcp-server"
+      ]
+    },
+    "StitchMCP": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@stitch-ui/mcp-server"
+      ]
+    },
+    "figma-remote": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-figma"
+      ]
+    },
+    "mongodb": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-mongodb"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-playwright"
+      ]
+    },
+    "supabase": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@supabase/mcp-server"
+      ]
+    }
+  }
+}
