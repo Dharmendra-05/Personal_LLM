@@ -1,9 +1,9 @@
-# Aether Agent v0.1.2 — Personal-LLM
+# Aether Agent v0.1.3 — Personal-LLM
 
 ## 14. Project Metadata
 
 **Project Name**: Personal-LLM
-**Version**: 0.1.2
+**Version**: 0.1.3
 **Author**: Dharmendra-05
 **Created**: 2026-05-25
 **Status**: In Development
@@ -26,6 +26,9 @@ Personal LLM Orchestrator for coordinating local and remote language models, man
 - [ ] Context-aware memory storage
 
 ## 16. Changelog
+
+### [0.1.3] - 2026-05-25
+- Modified 1 other
 
 ### [0.1.1] - 2026-05-25
 - Modified 10 other
