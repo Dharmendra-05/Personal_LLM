@@ -1,5 +1,5 @@
 {
-  "version": "0.1.3",
+  "version": "0.1.4",
   "release_date": "2026-05-25",
   "installed_rules": [
     "00-workflow-orchestration.md",
@@ -143,7 +143,7 @@
     "commands": 15,
     "specialist_personas": 3
   },
-  "last_updated": "2026-05-25T19:23:02Z",
+  "last_updated": "2026-05-28T18:15:42Z",
   "changelog": {
     "4.7.0": "Quality Hardening: Upgraded sync engine, expanded 6 thin workflows, fixed CLAUDE.md structure, converted boot to lazy-loading.",
     "4.1.1": "Executed God Mode pipeline. Packaged v4.1.1 release archive.",
@@ -162,6 +162,7 @@
     "4.12.4": "Modified 19 workflows, 1 other",
     "0.1.1": "Modified 10 other",
     "0.1.2": "Modified 10 other",
-    "0.1.3": "Modified 1 other"
+    "0.1.3": "Modified 1 other",
+    "0.1.4": "Integrated LM Studio local server support config and added the --lm-studio CLI toggle to main.py."
   }
 }

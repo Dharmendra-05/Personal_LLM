@@ -1,9 +1,9 @@
-# Aether Agent v0.1.3 — Personal-LLM
+# Aether Agent v0.1.4 — Personal-LLM
 
 ## 14. Project Metadata
 
 **Project Name**: Personal-LLM
-**Version**: 0.1.3
+**Version**: 0.1.4
 **Author**: Dharmendra-05
 **Created**: 2026-05-25
 **Status**: In Development
@@ -26,6 +26,11 @@ Personal LLM Orchestrator for coordinating local and remote language models, man
 - [ ] Context-aware memory storage
 
 ## 16. Changelog
+
+### [0.1.4] - 2026-05-28
+- Integrated LM Studio local server support via `models/model_configs/lm_studio.yaml`.
+- Added the `--lm-studio` command-line toggle to `main.py` to route chat and generation requests to the LM Studio API endpoint.
+- Synchronized system registry components.
 
 ### [0.1.3] - 2026-05-25
 - Modified 1 other
