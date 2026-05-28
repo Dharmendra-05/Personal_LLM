@@ -559,6 +559,8 @@ def _build_arg_parser(settings: "AppSettings") -> argparse.ArgumentParser:
     parser.add_argument("--model", "-m", default=settings.ollama.default_model,
                         metavar="NAME",
                         help=f"Default model (default: {settings.ollama.default_model}).")
+    parser.add_argument("--lm-studio", action="store_true",
+                        help="Use LM Studio local server instead of Ollama (overrides --model).")
     parser.add_argument(
         "--chat-model",
         default=os.environ.get("OLLAMA_CHAT_MODEL", ""),
@@ -832,6 +834,10 @@ def main() -> int:
 
     parser = _build_arg_parser(settings)
     args = parser.parse_args()
+
+    if getattr(args, "lm_studio", False):
+        args.model = "lm_studio"
+        args.chat_model = "lm_studio"
 
     if args.debug:
         setup_logging(

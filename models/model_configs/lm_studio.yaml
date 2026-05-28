@@ -1,0 +1,59 @@
+# ==== models/model_configs/lm_studio.yaml ====
+#
+# Model configuration: LM Studio Local Server (OpenAI Compatible API)
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisites:
+#   1. Open LM Studio on your local machine.
+#   2. Load your desired model (e.g., Gemma 3 or 4).
+#   3. Click "Start Server" (usually runs on http://127.0.0.1:1234/v1).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+
+# Unique registry key
+name: lm_studio
+
+# Human-readable description
+description: "Local LM Studio Server (OpenAI Compatible API)"
+
+# Arbitrary labels for filtering / grouping in the registry.
+tags:
+  - local
+  - lm-studio
+  - openai-compatible
+
+
+# ── Provider ──────────────────────────────────────────────────────────────────
+
+# Provider identifier — maps to OpenAICompatibleClient
+provider: openai_compatible
+
+# Base URL of the LM Studio HTTP server.
+base_url: http://127.0.0.1:1234/v1
+
+# The model name is ignored by LM Studio since it uses the currently loaded model,
+# but the client requires a string here.
+model_tag: local-model
+
+
+# ── Network ───────────────────────────────────────────────────────────────────
+
+# Per-request HTTP timeout in seconds.
+timeout: 180
+
+
+# ── Inference defaults ────────────────────────────────────────────────────────
+
+# LM Studio controls the generation parameters (Temperature, Top-K, etc.) on its end.
+# However, you can pass default overrides below which the client will send.
+temperature: 0.7
+max_tokens: 4096
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+system_prompt: >
+  You are a precise and efficient AI assistant with expertise in software
+  engineering, mathematics, and logical reasoning. Provide clear, correct,
+  and well-structured answers. For code tasks, include brief comments
+  explaining key decisions. Prefer conciseness over verbosity.
