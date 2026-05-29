@@ -2,7 +2,7 @@
 
 Personal LLM Orchestrator is a robust, local-first retrieval-augmented generation (RAG) and intelligent agentic routing system designed to manage and coordinate local (Ollama) and cloud language models.
 
----
+----
 
 ## ⚡ Key Features
 
