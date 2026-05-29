@@ -327,16 +327,20 @@ class ModelRegistry:
             name = get_settings().ollama.default_model
 
         if name not in self._configs and name != "auto-advanced":
-            # Standard error if model flat out doesn't exist
-            available: list[str] = sorted(self._configs.keys())
-            raise ModelConfigurationError(
-                message=(
-                    f"Model '{name}' is not registered. "
-                    f"Available models: {available}"
-                ),
-                model_name=name,
-                error_code="CFG_002",
-                details={"available_models": available},
+            # Dynamically register as a local Ollama model using default server base URL
+            from core.config import get_settings
+            try:
+                base_url = get_settings().ollama.base_url
+            except Exception:
+                base_url = "http://127.0.0.1:11434"
+
+            logger.info("Model '%s' not found in registry. Dynamically registering as a local Ollama model.", name)
+            self._configs[name] = ModelConfigSchema(
+                name=name,
+                provider="ollama",
+                model_tag=name,
+                base_url=base_url,
+                description=f"Dynamically registered Ollama model: {name}"
             )
 
         # Double-checked locking: fast path (no lock) for already-cached.

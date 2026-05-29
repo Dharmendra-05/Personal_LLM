@@ -40,7 +40,11 @@ class OpenAICompatibleClient(BaseLLMClient):
         timeout: int = 120,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(
+            model_name=model_name,
+            base_url=base_url,
+            timeout=timeout,
+        )
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key

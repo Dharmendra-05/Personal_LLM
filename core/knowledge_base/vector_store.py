@@ -95,6 +95,12 @@ os.environ["ANONYMIZED_TELEMETRY"] = "False"
 os.environ["ORT_LOG_LEVEL"] = "3" 
 
 try:
+    import posthog
+    posthog.capture = lambda *args, **kwargs: None
+except Exception:
+    pass
+
+try:
     import chromadb.telemetry.product
     import chromadb.telemetry.posthog
     import chromadb.telemetry.segment
