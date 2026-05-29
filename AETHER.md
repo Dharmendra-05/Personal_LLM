@@ -1,9 +1,9 @@
-# Aether Agent v0.1.4 — Personal-LLM
+# Aether Agent v0.1.6 — Personal-LLM
 
 ## 14. Project Metadata
 
 **Project Name**: Personal-LLM
-**Version**: 0.1.4
+**Version**: 0.1.6
 **Author**: Dharmendra-05
 **Created**: 2026-05-25
 **Status**: In Development
@@ -26,6 +26,16 @@ Personal LLM Orchestrator for coordinating local and remote language models, man
 - [ ] Context-aware memory storage
 
 ## 16. Changelog
+
+### [0.1.6] - 2026-05-29
+- Fixed ChromaDB telemetry crash by patching `posthog.capture` in `main.py` and `vector_store.py` to support variable positional arguments for newer `posthog` library versions.
+- Fixed `OpenAICompatibleClient` parent constructor initialization bug in `openai_compatible_client.py` to resolve `auto-advanced` fallback crashes.
+- Implemented dynamic registration in `ModelRegistry.get_model` to auto-configure unregistered model tags as local Ollama models on-the-fly.
+
+### [0.1.5] - 2026-05-29
+- Added `/toggle` (`/t`) and `/metadata` (`/meta`) quick toggle shortcuts.
+- Added `/menu` (`/m`) to open the interactive CLI Command Center.
+- Refactored `_run_repl` in `main.py` to use mutable reference states for toggling on-the-fly.
 
 ### [0.1.4] - 2026-05-28
 - Integrated LM Studio local server support via `models/model_configs/lm_studio.yaml`.
