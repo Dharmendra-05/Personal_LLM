@@ -41,6 +41,12 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 warnings.filterwarnings("ignore", category=UserWarning,  module="pydantic.*")
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers.*")
 
+try:
+    import posthog
+    posthog.capture = lambda *args, **kwargs: None
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # ② OS-level stderr redirect helper.
 #
@@ -210,6 +216,9 @@ _COMMANDS: Final[list[tuple[str, str, str]]] = [
     ("/health",  "",        "Check subsystem connectivity"),
     ("/route",   "<query>", "Show routing decision for a query (dry run)"),
     ("/model",   "<n>",     "Switch default model for this session"),
+    ("/toggle",  "",        "Cycle through registered LLM models (/t)"),
+    ("/metadata", "",       "Toggle showing query metadata (/meta)"),
+    ("/menu",    "",        "Open interactive Command Center (/m)"),
     ("/debug",   "<query>", "Process query and show full metadata"),
     ("/exit",    "",        "Exit the orchestrator"),
     ("/quit",    "",        "Exit the orchestrator"),
@@ -538,6 +547,96 @@ def _handle_model_switch(
     _print_ok(f"Default model switched to '{_bold(name)}'.")
 
 
+def _handle_model_cycle(
+    orch: SystemOrchestrator,
+    session_model: list[str | None],
+) -> None:
+    models = orch.list_models()
+    if not models:
+        _print_error("No models registered. Add YAML configs to models/model_configs/.")
+        return
+
+    current = session_model[0] or orch._default_model_name
+    model_names = [m["name"] for m in models]
+
+    if current in model_names:
+        idx = model_names.index(current)
+        next_idx = (idx + 1) % len(model_names)
+    else:
+        next_idx = 0
+
+    next_model = model_names[next_idx]
+    orch._default_model_name = next_model
+    session_model[0] = next_model
+    _print_ok(f"Default model switched to '{_bold(next_model)}'.")
+
+
+def _handle_metadata_toggle(
+    show_metadata_ref: list[bool],
+) -> None:
+    show_metadata_ref[0] = not show_metadata_ref[0]
+    status = _green("ON") if show_metadata_ref[0] else _red("OFF")
+    _print_ok(f"Query metadata display turned {status}.")
+
+
+def _handle_menu(
+    orch: SystemOrchestrator,
+    session_model: list[str | None],
+    show_metadata_ref: list[bool],
+) -> None:
+    print()
+    print(_bold(_cyan("  ╔══════════════════════════════════════════════════════╗")))
+    print(_bold(_cyan("  ║")) + _bold(_magenta("  Evelynn Interactive Command Center                 ")) + _bold(_cyan("║")))
+    print(_bold(_cyan("  ╚══════════════════════════════════════════════════════╝")))
+
+    while True:
+        current_model = session_model[0] or orch._default_model_name or "(auto)"
+        meta_status = _green("ON") if show_metadata_ref[0] else _red("OFF")
+
+        print(f"    {_yellow('1.')} Cycle Active Model  {_dim('(')}current: {_bold(current_model)}{_dim(')')}")
+        print(f"    {_yellow('2.')} Toggle Metadata      {_dim('(')}status: {meta_status}{_dim(')')}")
+        print(f"    {_yellow('3.')} Show Vector Stats")
+        print(f"    {_yellow('4.')} Re-index Documents")
+        print(f"    {_yellow('5.')} View History")
+        print(f"    {_yellow('6.')} Clear History")
+        print(f"    {_yellow('7.')} Subsystem Health")
+        print(f"    {_yellow('8.')} Show Help Reference")
+        print(f"    {_yellow('9.')} {_bold('Exit Command Center')}")
+        print()
+
+        try:
+            choice = input(_bold(_cyan("  Select [1-9] › "))).strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            _print_info("Exiting Command Center.")
+            break
+
+        if choice == "1":
+            _handle_model_cycle(orch, session_model)
+        elif choice == "2":
+            _handle_metadata_toggle(show_metadata_ref)
+        elif choice == "3":
+            _handle_stats(orch)
+        elif choice == "4":
+            _handle_reload(orch)
+        elif choice == "5":
+            _handle_history(orch)
+        elif choice == "6":
+            _handle_clear(orch)
+        elif choice == "7":
+            _handle_health(orch)
+        elif choice == "8":
+            _print_help()
+        elif choice == "9" or choice.lower() in ("exit", "q", "quit"):
+            _print_info("Exited Command Center.")
+            break
+        else:
+            _print_error("Invalid selection. Please choose an option from 1 to 9.")
+
+        print(_dim("    " + "─" * 46))
+
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -652,6 +751,7 @@ def _run_repl(
     from appearing as empty queries on the next turn.
     """
     session_model: list[str | None] = [None]
+    show_metadata_ref = [show_metadata]
 
     print(_dim(f"  Type your message and press Enter.  "
                f"Use {_yellow('/help')} for commands, {_yellow('Ctrl+C')} to quit."))
@@ -693,6 +793,12 @@ def _run_repl(
             elif cmd == "/health":    _handle_health(orch)
             elif cmd == "/route":     _handle_route(orch, args_str)
             elif cmd == "/model":     _handle_model_switch(orch, args_str, session_model)
+            elif cmd in ("/toggle", "/t"):
+                _handle_model_cycle(orch, session_model)
+            elif cmd in ("/metadata", "/meta"):
+                _handle_metadata_toggle(show_metadata_ref)
+            elif cmd in ("/menu", "/m"):
+                _handle_menu(orch, session_model, show_metadata_ref)
             elif cmd == "/debug":
                 query = args_str.strip()
                 if not query:
@@ -736,7 +842,7 @@ def _run_repl(
 
             print("\n")  # blank line after response
 
-            if show_metadata:
+            if show_metadata_ref[0]:
                 _print_metadata(
                     model=effective_model or orch._default_model_name or "unknown",
                     mode=decision.mode,
@@ -754,7 +860,7 @@ def _run_repl(
                 decision=decision,
                 max_tokens=_MAX_TOKENS[RouteMode.PERSONAL_MEMORY],
             )
-            _print_response(resp, show_metadata=show_metadata)
+            _print_response(resp, show_metadata=show_metadata_ref[0])
 
         # Flush stdin to discard Enter presses buffered during generation.
         _flush_stdin()
