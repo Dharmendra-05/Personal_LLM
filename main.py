@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ==== main.py ====
+# ===== main.py =====
 """
 Personal LLM Orchestrator — CLI Entry Point
 ============================================
