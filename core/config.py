@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -340,18 +340,29 @@ class AppSettings(BaseSettings):
     def as_safe_dict(self) -> dict[str, object]:
         """Return a redacted representation of the settings safe for logging.
 
-        Sensitive fields (API keys, passwords) are masked.  Currently the
-        orchestrator has no secrets, but this method is a pre-wired extension
-        point for when credentials are added.
+        Sensitive fields (API keys, tokens, passwords) are masked with ``"***"``.
 
         Returns:
             A nested dictionary of configuration values with sensitive fields
             replaced by ``"***"``.
         """
-        raw: dict[str, object] = self.model_dump()
-        # Extension point: mask secrets here when added, e.g.:
-        # raw["some_api_key"] = "***"
-        return raw
+        raw: dict[str, Any] = self.model_dump()
+        _SECRET_TERMS = {"key", "token", "secret", "password", "auth", "credential"}
+
+        def _redact(data: Any) -> Any:
+            if isinstance(data, dict):
+                redacted = {}
+                for k, v in data.items():
+                    if any(term in k.lower() for term in _SECRET_TERMS) and v:
+                        redacted[k] = "***"
+                    else:
+                        redacted[k] = _redact(v)
+                return redacted
+            elif isinstance(data, list):
+                return [_redact(item) for item in data]
+            return data
+
+        return _redact(raw)
 
 
 # ---------------------------------------------------------------------------

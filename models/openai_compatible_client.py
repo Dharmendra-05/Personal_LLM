@@ -49,6 +49,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.system_prompt: str | None = kwargs.get("system_prompt")
+        self.default_temperature: float = kwargs.get("default_temperature", 0.7)
         
         # Ensure URL points to the unified chat completions endpoint
         if not self.base_url.endswith("/chat/completions"):

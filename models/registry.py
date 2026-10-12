@@ -56,6 +56,7 @@ Example YAML::
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import Any, Final
@@ -164,6 +165,7 @@ class ModelConfigSchema(BaseModel):
     repeat_penalty: float = Field(default=1.1, ge=0.0)
     keep_alive: str = Field(default="5m")
     system_prompt: str | None = Field(default=None)
+    api_key: str = Field(default="", description="API key or token for authenticated providers.")
     description: str = Field(default="")
     tags: list[str] = Field(default_factory=list)
 
@@ -677,16 +679,16 @@ class ModelRegistry:
             "model_name": config.model_tag,
             "base_url": config.base_url,
             "timeout": config.timeout,
+            "default_temperature": config.temperature,
+            "default_max_tokens": config.max_tokens,
+            "system_prompt": config.system_prompt,
         }
 
         if config.provider == "ollama":
-            kwargs.update(
-                {
-                    "default_temperature": config.temperature,
-                    "default_max_tokens": config.max_tokens,
-                    "keep_alive": config.keep_alive,
-                }
-            )
+            kwargs["keep_alive"] = config.keep_alive
+        elif config.provider == "openai_compatible":
+            api_key = config.api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("HF_TOKEN") or "lm-studio"
+            kwargs["api_key"] = api_key
 
         try:
             client: BaseLLMClient = client_class(**kwargs)

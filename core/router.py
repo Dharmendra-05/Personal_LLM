@@ -238,7 +238,6 @@ _SIGNAL_TABLE: Final[list[_SignalEntry]] = [
     _kw(RouteMode.ADVANCED_KNOWLEDGE, 2.0, "compare"),
     _kw(RouteMode.ADVANCED_KNOWLEDGE, 2.0, "what happened in"),
     _kw(RouteMode.ADVANCED_KNOWLEDGE, 1.5, "explain the concept"),
-    _kw(RouteMode.ADVANCED_KNOWLEDGE, 1.0, "explain the concept"),
     # Structural regex — strong anchored signals
     _rx(RouteMode.ADVANCED_KNOWLEDGE, 5.0, "cmd_typo",       r"^\\[a-z]+$"),
     _rx(RouteMode.ADVANCED_KNOWLEDGE, 4.0, "explicit_search", r"^(search|research)\s+"),
@@ -280,13 +279,14 @@ class QueryRouter:
         self.default_mode: RouteMode = default_mode
 
         # Pre-split signals by type for fast hot-path matching
-        self._keyword_signals: list[tuple[RouteMode, float, str, str]] = []
+        self._keyword_signals: list[tuple[RouteMode, float, str, re.Pattern[str]]] = []
         self._regex_signals: list[tuple[RouteMode, float, str, re.Pattern[str]]] = []
 
         for mode, weight, label, pattern in _SIGNAL_TABLE:
             if pattern is None:
                 kw = label.split(":", 1)[1]
-                self._keyword_signals.append((mode, weight, label, kw))
+                kw_pattern = re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)
+                self._keyword_signals.append((mode, weight, label, kw_pattern))
             else:
                 self._regex_signals.append((mode, weight, label, pattern))
 
@@ -329,9 +329,9 @@ class QueryRouter:
         }
         matched: list[str] = []
 
-        # --- Keyword signals (hot path — simple substring) ---
-        for mode, weight, label, keyword in self._keyword_signals:
-            if keyword in query_lower:
+        # --- Keyword signals (word-boundary regex matching) ---
+        for mode, weight, label, kw_pattern in self._keyword_signals:
+            if kw_pattern.search(query):
                 scores[mode] += weight
                 matched.append(label)
 

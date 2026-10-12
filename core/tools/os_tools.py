@@ -13,6 +13,22 @@ from core.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+ALLOWED_ROOTS = [
+    Path.home() / "Documents",
+    Path.home() / "Downloads",
+    Path.cwd(),
+]
+
+def _assert_allowed_path(path: Path) -> Path:
+    resolved = path.resolve()
+    for root in ALLOWED_ROOTS:
+        try:
+            resolved.relative_to(root.resolve())
+            return resolved
+        except ValueError:
+            continue
+    raise PermissionError(f"Path '{resolved}' is outside permitted directory roots.")
+
 def open_folder(folder_path: str) -> str:
     """Open a folder on the host operating system.
 
@@ -22,7 +38,11 @@ def open_folder(folder_path: str) -> str:
     Returns:
         Status message of the action.
     """
-    path = Path(folder_path).resolve()
+    try:
+        path = _assert_allowed_path(Path(folder_path))
+    except PermissionError as pe:
+        return f"Security restriction: {pe}"
+
     if not path.exists():
         return f"Directory '{path}' does not exist on this machine."
     if not path.is_dir():
@@ -34,7 +54,6 @@ def open_folder(folder_path: str) -> str:
         elif sys.platform == "darwin":  # macOS
             subprocess.run(["open", str(path)], check=True)
         else:  # Linux (including WSL if configured correctly for xdg-open)
-            # In WSL, explorer.exe might be preferred to open Windows folders
             if "microsoft-standard" in os.uname().release.lower():
                 subprocess.run(["explorer.exe", str(path)], check=True)
             else:
@@ -54,7 +73,11 @@ def open_file(file_path: str) -> str:
     Returns:
         Status message of the action.
     """
-    path = Path(file_path).resolve()
+    try:
+        path = _assert_allowed_path(Path(file_path))
+    except PermissionError as pe:
+        return f"Security restriction: {pe}"
+
     if not path.exists():
         return f"File '{path}' does not exist on this machine."
     if not path.is_file():
