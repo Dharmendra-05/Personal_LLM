@@ -10,14 +10,10 @@
 # Application Logs and Data
 logs/
 data/
-docs/
 scripts/
 
 
 .scan_cache.json
-
-# Testing
-tests/
 
 # Aether Agents
 .agent/
